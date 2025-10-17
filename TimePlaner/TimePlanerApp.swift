@@ -7,14 +7,14 @@ struct TimeplanerApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
-        // لود خیلی زود (قبل از نمایش UI)
+        // بارگذاری داده‌ها قبل از نمایش UI
         appState.load()
     }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environment(appState)              // ← همین یک AppState همه‌جا
+                .environment(appState)              // AppState سراسری
                 .preferredColorScheme(.dark)
         }
         .onChange(of: scenePhase) { _, phase in

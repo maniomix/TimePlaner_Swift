@@ -156,6 +156,70 @@ enum Haptics {
     static func medium()  { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
 }
 
+// MARK: - Berlin Public Holidays (Feiertage) + 5h credit
+fileprivate func easterSunday(_ year: Int) -> Date? {
+    // Anonymous Gregorian algorithm
+    let a = year % 19
+    let b = year / 100
+    let c = year % 100
+    let d = b / 4
+    let e = b % 4
+    let f = (b + 8) / 25
+    let g = (b - f + 1) / 3
+    let h = (19 * a + b - d - g + 15) % 30
+    let i = c / 4
+    let k = c % 4
+    let l = (32 + 2 * e + 2 * i - h - k) % 7
+    let m = (a + 11 * h + 22 * l) / 451
+    let month = (h + l - 7 * m + 114) / 31   // March=3, April=4
+    let day = ((h + l - 7 * m + 114) % 31) + 1
+    var comp = DateComponents()
+    comp.year = year; comp.month = month; comp.day = day
+    return Calendar.isoMonday.date(from: comp)
+}
+
+fileprivate func berlinHolidayName(on date: Date) -> String? {
+    let cal = Calendar.isoMonday
+    let y = cal.component(.year, from: date)
+    let month = cal.component(.month, from: date)
+    let day = cal.component(.day, from: date)
+
+    // ثابت‌های سراسری آلمان + برلین
+    let fixed: [(m: Int, d: Int, name: String)] = [
+        (1, 1,   "Neujahr"),
+        (3, 8,   "Internationaler Frauentag"), // Berlin-specific
+        (5, 1,   "Tag der Arbeit"),
+        (10, 3,  "Tag der Deutschen Einheit"),
+        (12, 25, "1. Weihnachtstag"),
+        (12, 26, "2. Weihnachtstag"),
+    ]
+    if let hit = fixed.first(where: { $0.m == month && $0.d == day }) {
+        return hit.name
+    }
+
+    // تعطیلات وابسته به عید پاک
+    guard let easter = easterSunday(y) else { return nil }
+    func addDays(_ n: Int) -> Date { cal.date(byAdding: .day, value: n, to: easter)! }
+    let movable: [(offset: Int, name: String)] = [
+        (-2, "Karfreitag"),           // Good Friday
+        (+1, "Ostermontag"),          // Easter Monday
+        (+39, "Christi Himmelfahrt"), // Ascension
+        (+50, "Pfingstmontag")        // Whit Monday
+    ]
+    for m in movable {
+        let d = addDays(m.offset)
+        if cal.isDate(d, inSameDayAs: date) { return m.name }
+    }
+    return nil
+}
+
+fileprivate func isBerlinHoliday(_ date: Date) -> (isHoliday: Bool, name: String?, creditMin: Int) {
+    if let name = berlinHolidayName(on: date) {
+        return (true, name, 300) // 5h credit
+    }
+    return (false, nil, 0)
+}
+
 // MARK: - Root
 struct ContentView: View {
     @Environment(AppState.self) private var appState
@@ -278,6 +342,15 @@ struct MonateView: View {
         return (net, diff)
     }
 
+    // Helper to detect if there are any user-entered entries for a month
+    private func monthHasEntries(year: Int, month: Int) -> Bool {
+        let prefix = String(format: "%04d-%02d-", year, month)
+        for (k, v) in appState.entriesByDay {
+            if k.hasPrefix(prefix), !v.isEmpty { return true }
+        }
+        return false
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -289,7 +362,13 @@ struct MonateView: View {
                             Haptics.light()
                             pushMonth = MonthRoute(year: appState.selectedYear, month: m, monthNameDE: name)
                         } label: {
-                            MonthCard(name: name, month: m, netMinutes: info.net, diffMinutes: info.diff)
+                            MonthCard(
+                                name: name,
+                                month: m,
+                                netMinutes: info.net,
+                                diffMinutes: info.diff,
+                                showInfo: monthHasEntries(year: appState.selectedYear, month: m)
+                            )
                         }
                         .buttonStyle(PressScaleStyle())
                     }
@@ -310,6 +389,7 @@ private struct MonthCard: View {
     let name: String; let month: Int
     let netMinutes: Int
     let diffMinutes: Int
+    let showInfo: Bool
 
     var diffText: String {
         if diffMinutes == 0 { return "±00:00" }
@@ -333,18 +413,14 @@ private struct MonthCard: View {
                 Text("Monat \(month)")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(Theme.textSec)
-                // اطلاعات ماه
                 VStack(alignment: .leading, spacing: 2) {
-                    if netMinutes > 0 {
+                    if showInfo {
                         Text("Arbeitszeit: \(formatHHmm(netMinutes))")
                             .font(.system(size: 12))
                             .foregroundStyle(Theme.textSec)
                         Text("Abweichung: \(diffText)")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(diffColor)
-                    } else {
-                        // بدون داده: چیزی نشان نده (در صورت نیاز می‌تونی فعالش کنی)
-                        // Text("Keine Daten").font(.system(size: 12)).foregroundStyle(Theme.textSec.opacity(0.6))
                     }
                 }
                 .padding(.top, 6)
@@ -356,8 +432,6 @@ private struct MonthCard: View {
     }
 }
 
-
-
 struct PressScaleStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -365,7 +439,6 @@ struct PressScaleStyle: ButtonStyle {
             .animation(.spring(response: 0.28, dampingFraction: 0.82), value: configuration.isPressed)
     }
 }
-
 
 // MARK: - Week helpers
 struct WeekInfo: Identifiable, Hashable {
@@ -380,24 +453,36 @@ fileprivate struct GermanFormatters {
     static let dayNum: DateFormatter    = { let df = DateFormatter(); df.locale = Locale(identifier: "de_DE"); df.setLocalizedDateFormatFromTemplate("d");   return df }()
     static let weekdayShort: DateFormatter = { let df = DateFormatter(); df.locale = Locale(identifier: "de_DE"); df.setLocalizedDateFormatFromTemplate("EEE"); return df }()
 }
+
+// ✅ ماه از روز ۱ شروع می‌شود، بدون قاطی شدن با ماه قبل/بعد
 fileprivate func weeksInMonth(year: Int, month: Int) -> [WeekInfo] {
     let cal = Calendar.isoMonday
     let comps = DateComponents(year: year, month: month, day: 1)
-    guard let first = cal.date(from: comps),
-          let range = cal.range(of: .day, in: .month, for: first) else { return [] }
-    var mondays: [Date] = []
-    for d in range {
-        let c = DateComponents(year: year, month: month, day: d)
-        guard let date = cal.date(from: c) else { continue }
-        if cal.component(.weekday, from: date) == 2 { mondays.append(date) } // Monday
+    guard let firstDay = cal.date(from: comps),
+          let dayRange = cal.range(of: .day, in: .month, for: firstDay),
+          let lastDay = cal.date(byAdding: .day, value: dayRange.count - 1, to: firstDay) else {
+        return []
     }
-    return mondays.compactMap { mon in
-        guard let sat = cal.date(byAdding: .day, value: 5, to: mon) else { return nil }
-        let w = cal.component(.weekOfYear, from: mon)
-        let y = cal.component(.yearForWeekOfYear, from: mon)
-        return WeekInfo(yearForWeek: y, weekOfYear: w, monday: mon, saturday: sat)
+
+    var result: [WeekInfo] = []
+    var start = firstDay
+
+    while start <= lastDay {
+        let theoreticalEnd = cal.date(byAdding: .day, value: 5, to: start)!
+        let end = min(theoreticalEnd, lastDay)
+        let kw = cal.component(.weekOfYear, from: start)
+        let yw = cal.component(.yearForWeekOfYear, from: start)
+        result.append(WeekInfo(yearForWeek: yw, weekOfYear: kw, monday: start, saturday: end))
+
+        if let next = cal.date(byAdding: .day, value: 7, to: start), next <= lastDay {
+            start = next
+        } else {
+            break
+        }
     }
+    return result
 }
+
 fileprivate func weekLabel(_ w: WeekInfo) -> String {
     let sd = GermanFormatters.dayNum.string(from: w.monday)
     let ed = GermanFormatters.dayNum.string(from: w.saturday)
@@ -406,26 +491,32 @@ fileprivate func weekLabel(_ w: WeekInfo) -> String {
     return sm == em ? "KW \(w.weekOfYear) · \(sd)–\(ed) \(em)" : "KW \(w.weekOfYear) · \(sd) \(sm) – \(ed) \(em)"
 }
 
-// Month totals helper (Gross/Break/Net for a given month)
+// Month totals helper (Gross/Break/Net for a given month) — شامل اعتبار تعطیلات
 fileprivate func computeMonthTotals(year: Int, month: Int, data: [String: [WorkEntry]]) -> (gross: Int, brk: Int, net: Int) {
     let cal = Calendar.isoMonday
     let comps = DateComponents(year: year, month: month, day: 1)
     guard let first = cal.date(from: comps),
           let range = cal.range(of: .day, in: .month, for: first) else { return (0,0,0) }
 
-    var g = 0, b = 0
+    var g = 0, b = 0, credit = 0
     for d in range {
         let c = DateComponents(year: year, month: month, day: d)
         guard let date = cal.date(from: c) else { continue }
         let wd = cal.component(.weekday, from: date)
         guard wd != 1 else { continue } // Sonntag محاسبه نشود
+
         let key = dayKey(date)
         let entries = data[key] ?? []
         let dayG = entries.reduce(0) { $0 + minutesBetween($1.start, $1.end) }
         let dayB = breakMinutes(forGross: dayG)
         g += dayG; b += dayB
+
+        // اعتبار تعطیلات
+        let hol = isBerlinHoliday(date)
+        credit += hol.creditMin
     }
-    return (g, b, g - b)
+    let net = max(0, g - b) + credit
+    return (g + credit, b, net)
 }
 
 // MARK: - ProgressRing
@@ -468,7 +559,7 @@ struct ProgressRing: View {
     }
 }
 
-// MARK: - Month Picker (weeks + MONTH SUMMARY + Reset + weekly 30h badge)
+// MARK: - Month Picker (weeks + MONTH SUMMARY + Reset + weekly 30h badge + total delta)
 struct MonthPickerView: View {
     @Environment(AppState.self) private var appState
     let selectedYear: Int
@@ -491,22 +582,29 @@ struct MonthPickerView: View {
         Haptics.warning()
     }
 
-    // Net هفته (Mon–Sat)
+    // Net هفته (Mon–Sat) — شامل اعتبار تعطیلات
     private func netForWeek(_ w: WeekInfo) -> Int {
         let cal = Calendar.isoMonday
-        var total = 0
+        var totalG = 0, totalB = 0, credit = 0
         for i in 0...5 {
             if let d = cal.date(byAdding: .day, value: i, to: w.monday) {
+                // فقط روزهای داخل همان ماهِ شروع هفته
+                if cal.component(.month, from: d) != cal.component(.month, from: w.monday) { continue }
                 let key = dayKey(d)
                 let g = (appState.entriesByDay[key] ?? []).reduce(0) { $0 + minutesBetween($1.start, $1.end) }
-                total += (g - breakMinutes(forGross: g))
+                totalG += g
+                totalB += breakMinutes(forGross: g)
+
+                let hol = isBerlinHoliday(d)
+                credit += hol.creditMin
             }
         }
-        return max(0, total)
+        return max(0, totalG - totalB) + credit
     }
 
     var body: some View {
         List {
+            // هفته‌ها
             Section {
                 ForEach(weeks) { w in
                     let net = netForWeek(w)
@@ -531,8 +629,6 @@ struct MonthPickerView: View {
                             // Badge 30h: سبز/قرمز/مخفی
                             let threshold = 30 * 60
                             let diff = net - threshold
-
-                            // فقط اگر این هفته "داده" دارد (net > 0) و با آستانه تفاوت دارد نشان بده
                             if net > 0 && diff != 0 {
                                 Text("\(diff > 0 ? "+" : "-")\(formatHHmm(abs(diff)))")
                                     .font(.system(size: 11, weight: .semibold))
@@ -550,6 +646,40 @@ struct MonthPickerView: View {
                 }
             } header: { Text("Woche wählen") }
 
+            // جمع کل اضافه/کم‌کاری همه‌ی هفته‌ها — inline capsule next to label
+            Section {
+                let threshold = 30 * 60
+                let totalDelta = weeks.reduce(0) { acc, w in acc + (netForWeek(w) - threshold) }
+
+                HStack(spacing: 8) {
+                    Text("Summe (Wochenabweichungen):")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.textSec)
+
+                    if totalDelta != 0 {
+                        Text("\(totalDelta > 0 ? "+" : "-")\(formatHHmm(abs(totalDelta))) gesamt")
+                            .font(.system(size: 12, weight: .semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill((totalDelta > 0 ? Color.green : Color.red).opacity(0.18)))
+                            .overlay(Capsule().stroke((totalDelta > 0 ? Color.green : Color.red).opacity(0.35), lineWidth: 1))
+                            .foregroundStyle(totalDelta > 0 ? .green : .red)
+                    } else {
+                        Text("±00:00 gesamt")
+                            .font(.system(size: 12, weight: .semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Theme.card))
+                            .overlay(Capsule().stroke(Theme.stroke, lineWidth: 1))
+                            .foregroundStyle(Theme.textSec)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
+                .listRowBackground(Color.clear)
+            }
+
+            // خلاصه ماه
             Section {
                 HStack(spacing: 12) {
                     SummaryChip(title: "Gesamt",       value: formatHHmm(monthlyTotals.gross))
@@ -595,27 +725,45 @@ struct MonthPickerView: View {
             .padding(.horizontal, 16)
             .padding(.top, 2)
         }
-        // .animation(.snappy, value: weeks) // removed
-        // .animation(.snappy, value: appState.entriesByDay) // removed
     }
 }
 
-// MARK: - Week View (Mon–Sat + weekly totals)  — labels updated
+// MARK: - Week View (Mon–Sat + weekly totals) — FT + Feiertag
 struct WeekView: View {
     @Environment(AppState.self) private var appState
     let week: WeekInfo
     private let cal = Calendar.isoMonday
-    private var days: [Date] { (0...5).compactMap { cal.date(byAdding: .day, value: $0, to: week.monday) } }
+    // فقط روزهای داخل همان ماهِ شروع بلوک هفته را نشان بده
+    private var days: [Date] {
+        let baseMonth = cal.component(.month, from: week.monday)
+        return (0...5).compactMap {
+            guard let d = cal.date(byAdding: .day, value: $0, to: week.monday),
+                  cal.component(.month, from: d) == baseMonth else { return nil }
+            return d
+        }
+    }
 
     private var weeklyTotals: (gross: Int, brk: Int, net: Int) {
-        var g = 0, b = 0
+        var g = 0, b = 0, credit = 0
         for d in days {
             let key = dayKey(d)
             let dayG = (appState.entriesByDay[key] ?? []).reduce(0) { $0 + minutesBetween($1.start, $1.end) }
-            let dayB = breakMinutes(forGross: dayG)
-            g += dayG; b += dayB
+            g += dayG
+            b += breakMinutes(forGross: dayG)
+
+            let hol = isBerlinHoliday(d)
+            credit += hol.creditMin
         }
-        return (g, b, g - b)
+        return (g + credit, b, max(0, g - b) + credit)
+    }
+
+    // اگر این هفته حداقل یک روز ورودی دارد → روزهای ۰ دقیقه به صورت FT
+    private var hasDataThisWeek: Bool {
+        for d in days {
+            let key = dayKey(d)
+            if let arr = appState.entriesByDay[key], !arr.isEmpty { return true }
+        }
+        return false
     }
 
     var body: some View {
@@ -632,10 +780,18 @@ struct WeekView: View {
             Section {
                 ForEach(days, id: \.self) { d in
                     let key = dayKey(d)
-                    let gross = (appState.entriesByDay[key] ?? []).reduce(0) { $0 + minutesBetween($1.start, $1.end) }
-                    let brk = breakMinutes(forGross: gross)
+                    let rawGross = (appState.entriesByDay[key] ?? []).reduce(0) { $0 + minutesBetween($1.start, $1.end) }
+                    let brk = breakMinutes(forGross: rawGross)
+
+                    let hol = isBerlinHoliday(d)                 // (isHoliday, name, creditMin)
+                    let displayGross = rawGross + hol.creditMin  // برای نمایش عدد ساعت
+
                     NavigationLink { DayDetailView(date: d) } label: {
-                        DayRow(date: d, gross: gross, brk: brk)
+                        DayRow(date: d,
+                               grossDisplay: displayGross,
+                               brkFromWork: brk,
+                               holidayName: hol.name,
+                               showFT: hasDataThisWeek)
                     }
                     .listRowBackground(Color.clear)
                 }
@@ -646,7 +802,6 @@ struct WeekView: View {
         .background(Color.clear.ignoresSafeArea())
         .navigationTitle("KW \(week.weekOfYear)")
         .navigationBarTitleDisplayMode(.inline)
-        // .animation(.snappy, value: appState.entriesByDay) // removed
     }
 }
 
@@ -667,39 +822,80 @@ private struct SummaryChip: View {
     }
 }
 
+// ✅ DayRow با منطق FT + Holiday
 private struct DayRow: View {
     let date: Date
-    let gross: Int
-    let brk: Int
-    var net: Int { gross - brk }
+    let grossDisplay: Int      // شامل اعتبار 5h تعطیل (در صورت وجود)
+    let brkFromWork: Int       // فقط برای کار واقعی
+    let holidayName: String?   // برای نمایش کپسول
+    let showFT: Bool
+
+    private var netDisplay: Int { max(0, grossDisplay - brkFromWork) }
 
     var body: some View {
         HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(GermanFormatters.weekdayShort.string(from: date))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Theme.textPri)
-                Text(DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .none))
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.textSec)
+                HStack(spacing: 6) {
+                    Text(DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .none))
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.textSec)
+                    if let name = holidayName {
+                        HolidayBadge(name: name)
+                    }
+                }
             }
             Spacer()
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(formatHHmm(gross))
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
-                    .foregroundStyle(Theme.textPri)
-                if brk > 0 {
-                    PauseBadge(minutes: brk)
-                } else {
-                    Text("Arbeitszeit \(formatHHmm(net))")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.textSec)
+
+            if grossDisplay == 0 && showFT {
+                FTBadge()
+            } else {
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(formatHHmm(grossDisplay))
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .foregroundStyle(Theme.textPri)
+                    if brkFromWork > 0 {
+                        PauseBadge(minutes: brkFromWork)
+                    } else {
+                        Text("Arbeitszeit \(formatHHmm(netDisplay))")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textSec)
+                    }
                 }
             }
             Image(systemName: "chevron.right").foregroundStyle(Theme.textSec)
         }
         .padding(.vertical, 6)
         .contentShape(Rectangle())
+    }
+}
+
+private struct FTBadge: View {
+    var body: some View {
+        Text("FT")
+            .font(.system(size: 12, weight: .semibold))
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Capsule().fill(Color.orange.opacity(0.2)))
+            .overlay(Capsule().stroke(Color.orange.opacity(0.35), lineWidth: 1))
+            .foregroundStyle(Color.orange)
+    }
+}
+
+private struct HolidayBadge: View {
+    let name: String
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "sun.max.fill")
+                .font(.system(size: 9, weight: .semibold))
+            Text("Feiertag")
+                .font(.system(size: 9, weight: .semibold))
+        }
+        .padding(.horizontal, 8).padding(.vertical, 3)
+        .background(Capsule().fill(Color.yellow.opacity(0.18)))
+        .overlay(Capsule().stroke(Color.yellow.opacity(0.35), lineWidth: 1))
+        .foregroundStyle(Color.yellow)
     }
 }
 
@@ -716,7 +912,7 @@ private struct PauseBadge: View {
     }
 }
 
-// MARK: - Day Detail (list + add/edit/delete) — labels updated
+// MARK: - Day Detail (list + add/edit/delete)
 struct DayDetailView: View {
     @Environment(AppState.self) private var appState
     let date: Date
@@ -728,13 +924,14 @@ struct DayDetailView: View {
 
     private var dayGross: Int { entries.reduce(0) { $0 + minutesBetween($1.start, $1.end) } }
     private var dayBreak: Int { breakMinutes(forGross: dayGross) }
-    private var dayNet: Int { dayGross - dayBreak }
+    private var dayHolidayCredit: Int { isBerlinHoliday(date).creditMin }
+    private var dayNet: Int { max(0, dayGross - dayBreak) + dayHolidayCredit }
 
     var body: some View {
         List {
             Section {
                 HStack(spacing: 12) {
-                    SummaryChip(title: "Gesamt",       value: formatHHmm(dayGross))
+                    SummaryChip(title: "Gesamt",       value: formatHHmm(dayGross + dayHolidayCredit))
                     SummaryChip(title: "Pause",        value: formatHHmm(dayBreak))
                     SummaryChip(title: "Arbeitszeit",  value: formatHHmm(dayNet))
                 }
@@ -744,7 +941,11 @@ struct DayDetailView: View {
 
             Section {
                 if entries.isEmpty {
-                    Text("Kein Eintrag").foregroundStyle(Theme.textSec)
+                    if let name = isBerlinHoliday(date).name {
+                        Text("Feiertag: \(name) (5h Kredit)").foregroundStyle(Theme.textSec)
+                    } else {
+                        Text("Kein Eintrag").foregroundStyle(Theme.textSec)
+                    }
                 } else {
                     ForEach(entries) { e in
                         HStack {
@@ -816,7 +1017,6 @@ struct DayDetailView: View {
         }
         .navigationTitle(GermanFormatters.weekdayShort.string(from: date))
         .navigationBarTitleDisplayMode(.inline)
-        // .animation(.snappy, value: appState.entriesByDay) // removed
     }
 
     private func deleteOffsets(at offsets: IndexSet) {
@@ -940,8 +1140,8 @@ struct StatistikView: View {
             return (0,0,0,[])
         }
 
-        var perWeek: [Int: (g: Int, b: Int)] = [:]
-        var totalG = 0, totalB = 0
+        var perWeek: [Int: (g: Int, b: Int, credit: Int)] = [:]
+        var totalG = 0, totalB = 0, totalCredit = 0
 
         for d in dayRange {
             let c = DateComponents(year: year, month: month, day: d)
@@ -954,18 +1154,24 @@ struct StatistikView: View {
             let b = breakMinutes(forGross: g)
             totalG += g; totalB += b
 
+            let hol = isBerlinHoliday(date)
+            totalCredit += hol.creditMin
+
             let kw = cal.component(.weekOfYear, from: date)
-            var w = perWeek[kw] ?? (0,0)
-            w.g += g; w.b += b
+            var w = perWeek[kw] ?? (0,0,0)
+            w.g += g; w.b += b; w.credit += hol.creditMin
             perWeek[kw] = w
         }
 
         let weekInfos = perWeek.keys.sorted().map { kw in
             let val = perWeek[kw]!
-            return WeekStat(kw: kw, net: max(0, val.g - val.b), gross: val.g, brk: val.b)
+            return WeekStat(kw: kw,
+                            net: max(0, val.g - val.b) + val.credit,
+                            gross: val.g + val.credit,
+                            brk: val.b)
         }
 
-        return (totalG, totalB, max(0, totalG - totalB), weekInfos)
+        return (totalG + totalCredit, totalB, max(0, totalG - totalB) + totalCredit, weekInfos)
     }
 
     var body: some View {
@@ -1053,37 +1259,6 @@ struct StatistikView: View {
                         .frame(height: 220)
                         .padding(.horizontal, 12)
                     }
-                }
-
-                // لیست هفته‌ها
-                if !result.weeks.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Wöchentlich")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(Theme.textSec)
-                            .padding(.horizontal, 16)
-
-                        ForEach(result.weeks) { w in
-                            HStack {
-                                Text("KW \(w.kw)")
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(Theme.textPri)
-                                Spacer()
-                                VStack(alignment: .trailing, spacing: 2) {
-                                    Text("Gesamt \(formatHHmm(w.gross))").foregroundStyle(Theme.textSec).font(.system(size: 12))
-                                    Text("Pause \(formatHHmm(w.brk))").foregroundStyle(Theme.textSec).font(.system(size: 12))
-                                    Text("Arbeitszeit \(formatHHmm(w.net))").foregroundStyle(Theme.textPri).font(.system(size: 13, weight: .bold))
-                                }
-                            }
-                            .padding(12)
-                            .background(
-                                RoundedRectangle(cornerRadius: 14)
-                                    .fill(Theme.card)
-                                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.stroke, lineWidth: 1))
-                            )
-                            .padding(.horizontal, 16)
-                        }
-                    }
                 } else {
                     Text("Keine Daten für diesen Monat.")
                         .foregroundStyle(Theme.textSec)
@@ -1096,7 +1271,6 @@ struct StatistikView: View {
         .background(Color.clear)
         .navigationTitle("Statistik")
         .navigationBarTitleDisplayMode(.inline)
-        // .animation(.snappy, value: appState.entriesByDay) // removed
         .onAppear { refreshGoalForCurrentMonth() }
     }
 
@@ -1134,6 +1308,7 @@ private struct MonthChip: View {
             .foregroundStyle(isSelected ? Theme.accent : Theme.textPri)
     }
 }
+
 // MARK: - Einstellungen (فقط نمایش و تنظیمات عمومی)
 private struct IslandHeader: View {
     let title: String
@@ -1231,7 +1406,6 @@ struct GoalDial: View {
 
                             if let last = lastAngle {
                                 var delta = angle - last
-                                // normalize delta to [-π, π]
                                 if delta > .pi { delta -= 2 * .pi }
                                 if delta < -.pi { delta += 2 * .pi }
 
