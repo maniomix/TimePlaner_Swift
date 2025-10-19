@@ -1,3 +1,4 @@
+
 import SwiftUI
 import Observation
 import Charts
@@ -454,7 +455,6 @@ fileprivate struct GermanFormatters {
     static let weekdayShort: DateFormatter = { let df = DateFormatter(); df.locale = Locale(identifier: "de_DE"); df.setLocalizedDateFormatFromTemplate("EEE"); return df }()
 }
 
-// ✅ ماه از روز ۱ شروع می‌شود، بدون قاطی شدن با ماه قبل/بعد
 fileprivate func weeksInMonth(year: Int, month: Int) -> [WeekInfo] {
     let cal = Calendar.isoMonday
     let comps = DateComponents(year: year, month: month, day: 1)
@@ -465,21 +465,39 @@ fileprivate func weeksInMonth(year: Int, month: Int) -> [WeekInfo] {
     }
 
     var result: [WeekInfo] = []
-    var start = firstDay
 
-    while start <= lastDay {
-        let theoreticalEnd = cal.date(byAdding: .day, value: 5, to: start)!
-        let end = min(theoreticalEnd, lastDay)
-        let kw = cal.component(.weekOfYear, from: start)
-        let yw = cal.component(.yearForWeekOfYear, from: start)
-        result.append(WeekInfo(yearForWeek: yw, weekOfYear: kw, monday: start, saturday: end))
+    // 1) First block: start at the 1st (even if mid‑week), end at upcoming Sunday or month end
+    let wdFirst = cal.component(.weekday, from: firstDay) // Mon=2 … Sun=1
+    let daysToSunday = (1 - wdFirst + 7) % 7 // distance to Sunday (1)
+    let firstEnd = min(cal.date(byAdding: .day, value: daysToSunday, to: firstDay)!, lastDay)
+    result.append(WeekInfo(
+        yearForWeek: cal.component(.yearForWeekOfYear, from: firstDay),
+        weekOfYear: cal.component(.weekOfYear, from: firstDay),
+        monday: firstDay,
+        saturday: firstEnd
+    ))
 
-        if let next = cal.date(byAdding: .day, value: 7, to: start), next <= lastDay {
-            start = next
-        } else {
-            break
+    // 2) Subsequent full weeks: Mon–Sun, starting from the day after firstEnd
+    var currentStart = cal.date(byAdding: .day, value: 1, to: firstEnd)!
+    while currentStart <= lastDay {
+        // ensure we’re on Monday (if we started on Monday this stays the same; otherwise jump to next Monday)
+        let wd = cal.component(.weekday, from: currentStart)
+        let toMonday = (2 - wd + 7) % 7
+        if toMonday != 0 {
+            currentStart = cal.date(byAdding: .day, value: toMonday, to: currentStart)!
         }
+        if currentStart > lastDay { break }
+
+        let weekEnd = min(cal.date(byAdding: .day, value: 6, to: currentStart)!, lastDay)
+        result.append(WeekInfo(
+            yearForWeek: cal.component(.yearForWeekOfYear, from: currentStart),
+            weekOfYear: cal.component(.weekOfYear, from: currentStart),
+            monday: currentStart,
+            saturday: weekEnd
+        ))
+        currentStart = cal.date(byAdding: .day, value: 7, to: currentStart)!
     }
+
     return result
 }
 
@@ -582,24 +600,41 @@ struct MonthPickerView: View {
         Haptics.warning()
     }
 
-    // Net هفته (Mon–Sat) — شامل اعتبار تعطیلات
+    // Net هفته (Mon–Sun) — شامل اعتبار تعطیلات، محاسبه فقط برای Mo–Sa (skip So)
     private func netForWeek(_ w: WeekInfo) -> Int {
         let cal = Calendar.isoMonday
         var totalG = 0, totalB = 0, credit = 0
-        for i in 0...5 {
-            if let d = cal.date(byAdding: .day, value: i, to: w.monday) {
-                // فقط روزهای داخل همان ماهِ شروع هفته
-                if cal.component(.month, from: d) != cal.component(.month, from: w.monday) { continue }
-                let key = dayKey(d)
-                let g = (appState.entriesByDay[key] ?? []).reduce(0) { $0 + minutesBetween($1.start, $1.end) }
-                totalG += g
-                totalB += breakMinutes(forGross: g)
-
+        var d = w.monday
+        while d <= w.saturday {
+            // فقط روزهای داخل همان ماهِ شروع بلوک هفته
+            if cal.component(.month, from: d) == cal.component(.month, from: w.monday) {
+                let wd = cal.component(.weekday, from: d)
+                if wd != 1 { // skip Sunday from totals
+                    let key = dayKey(d)
+                    let g = (appState.entriesByDay[key] ?? []).reduce(0) { $0 + minutesBetween($1.start, $1.end) }
+                    totalG += g
+                    totalB += breakMinutes(forGross: g)
+                }
                 let hol = isBerlinHoliday(d)
                 credit += hol.creditMin
             }
+            d = cal.date(byAdding: .day, value: 1, to: d)!
         }
         return max(0, totalG - totalB) + credit
+    }
+
+    // Helper: check if a week has user-entered entries (ignoring pure-holiday credits)
+    private func hasEntriesInWeek(_ w: WeekInfo) -> Bool {
+        let cal = Calendar.isoMonday
+        var d = w.monday
+        while d <= w.saturday {
+            if cal.component(.month, from: d) == cal.component(.month, from: w.monday) {
+                let key = dayKey(d)
+                if let arr = appState.entriesByDay[key], !arr.isEmpty { return true }
+            }
+            d = cal.date(byAdding: .day, value: 1, to: d)!
+        }
+        return false
     }
 
     var body: some View {
@@ -629,7 +664,8 @@ struct MonthPickerView: View {
                             // Badge 30h: سبز/قرمز/مخفی
                             let threshold = 30 * 60
                             let diff = net - threshold
-                            if net > 0 && diff != 0 {
+                            let hasData = hasEntriesInWeek(w)
+                            if hasData && diff != 0 {
                                 Text("\(diff > 0 ? "+" : "-")\(formatHHmm(abs(diff)))")
                                     .font(.system(size: 11, weight: .semibold))
                                     .padding(.horizontal, 10).padding(.vertical, 4)
@@ -649,7 +685,11 @@ struct MonthPickerView: View {
             // جمع کل اضافه/کم‌کاری همه‌ی هفته‌ها — inline capsule next to label
             Section {
                 let threshold = 30 * 60
-                let totalDelta = weeks.reduce(0) { acc, w in acc + (netForWeek(w) - threshold) }
+                let totalDelta = weeks.reduce(0) { acc, w in
+                    let diff = netForWeek(w) - threshold
+                    let hasData = hasEntriesInWeek(w)
+                    return (hasData && diff != 0) ? acc + diff : acc
+                }
 
                 HStack(spacing: 8) {
                     Text("Summe (Wochenabweichungen):")
@@ -733,19 +773,23 @@ struct WeekView: View {
     @Environment(AppState.self) private var appState
     let week: WeekInfo
     private let cal = Calendar.isoMonday
-    // فقط روزهای داخل همان ماهِ شروع بلوک هفته را نشان بده
+    // فقط روزهای داخل همان ماهِ شروع بلوک هفته را نشان بده (Mon–Sat)
     private var days: [Date] {
         let baseMonth = cal.component(.month, from: week.monday)
-        return (0...5).compactMap {
-            guard let d = cal.date(byAdding: .day, value: $0, to: week.monday),
-                  cal.component(.month, from: d) == baseMonth else { return nil }
-            return d
+        var arr: [Date] = []
+        var d = week.monday
+        while d <= week.saturday {
+            if cal.component(.month, from: d) == baseMonth { arr.append(d) }
+            d = cal.date(byAdding: .day, value: 1, to: d)!
         }
+        return arr
     }
 
     private var weeklyTotals: (gross: Int, brk: Int, net: Int) {
         var g = 0, b = 0, credit = 0
         for d in days {
+            let wd = cal.component(.weekday, from: d)
+            if wd == 1 { continue }
             let key = dayKey(d)
             let dayG = (appState.entriesByDay[key] ?? []).reduce(0) { $0 + minutesBetween($1.start, $1.end) }
             g += dayG
@@ -795,7 +839,7 @@ struct WeekView: View {
                     }
                     .listRowBackground(Color.clear)
                 }
-            } header: { Text("Montag – Samstag") }
+            } header: { Text("Montag – Sonntag") }
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
@@ -1375,24 +1419,116 @@ struct GoalDial: View {
     let totalNetMinutes: Int
     @Binding var goalHours: Int
     var minHours: Int = 80
-    var maxHours: Int = 240
+    var maxHours: Int = 190
     var stepHours: Int = 1
 
     @State private var lastAngle: Double? = nil   // radians
     @State private var accum: Double = 0          // accumulated radians since last step
+    @State private var isDragging: Bool = false
+    private let orbitScale: CGFloat = 1.10 // ring the knob orbits on (slightly outside the progress ring)
+
+    // Visual knob position around the ring
+    private var fraction: Double {
+        let clamped = max(minHours, min(maxHours, goalHours))
+        return Double(clamped - minHours) / Double(maxHours - minHours)
+    }
+    private func knobOffset(size: CGFloat) -> CGSize {
+        let r = (size/2) * orbitScale // align knob to the outer orbit ring
+        let angle = -Double.pi/2 + 2 * Double.pi * fraction
+        return CGSize(width: CGFloat(cos(angle)) * r, height: CGFloat(sin(angle)) * r)
+    }
+
+    // Map polar angle to hours, so knob follows finger directly
+    private func hours(from angle: Double) -> Int {
+        // Map angle (-π..+π) so that -π/2 (top) == 0 fraction; go clockwise
+        var a = angle + Double.pi/2
+        while a < 0 { a += 2 * Double.pi }
+        while a >= 2 * Double.pi { a -= 2 * Double.pi }
+        let span = maxHours - minHours
+        let raw = Double(minHours) + (a / (2 * Double.pi)) * Double(span)
+        // snap to stepHours
+        let stepped = Double(stepHours) * (raw / Double(stepHours)).rounded()
+        let clamped = max(Double(minHours), min(Double(maxHours), stepped))
+        return Int(clamped)
+    }
 
     private var goalMinutes: Int { max(minHours, min(maxHours, goalHours)) * 60 }
     private var progress: Double {
         guard goalMinutes > 0 else { return 0 }
         return min(Double(totalNetMinutes) / Double(goalMinutes), 1.0)
     }
-
+    
     var body: some View {
         VStack(spacing: 8) {
             GeometryReader { geo in
                 let size = min(geo.size.width, geo.size.height)
                 ZStack {
+                    // Base ring with progress
                     ProgressRing(progress: progress, totalMinutes: totalNetMinutes, goalMinutes: goalMinutes)
+
+                    // Static orbit track (slightly thicker while dragging)
+                    Circle()
+                        .stroke(Color.blue.opacity(isDragging ? 0.35 : 0.25), lineWidth: isDragging ? 3 : 2)
+                        .scaleEffect(orbitScale)
+                        .animation(.easeInOut(duration: 0.18), value: isDragging)
+
+                    // Orbit trail (from top to current position), matching the orbit track
+                    Circle()
+                        .trim(from: 0, to: CGFloat(max(0.001, fraction)))
+                        .stroke(
+                            AngularGradient(
+                                gradient: Gradient(colors: [Color.blue, Color.green]),
+                                center: .center,
+                                startAngle: .degrees(0),
+                                endAngle: .degrees(360)
+                            ),
+                            style: StrokeStyle(lineWidth: isDragging ? 4 : 3, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .scaleEffect(orbitScale)
+                        .opacity(isDragging ? 0.6 : 0.45)
+                        .animation(.easeInOut(duration: 0.18), value: isDragging)
+                        .animation(.easeInOut(duration: 0.18), value: goalHours)
+                        .overlay(
+                            // Glow: duplicate the same trimmed arc, thicker + blurred underlay
+                            Circle()
+                                .trim(from: 0, to: CGFloat(max(0.001, fraction)))
+                                .stroke(
+                                    AngularGradient(
+                                        gradient: Gradient(colors: [Color.blue.opacity(0.9), Color.green.opacity(0.8)]),
+                                        center: .center,
+                                        startAngle: .degrees(0),
+                                        endAngle: .degrees(360)
+                                    ),
+                                    style: StrokeStyle(lineWidth: isDragging ? 5 : 3, lineCap: .round)
+                                )
+                                .rotationEffect(.degrees(-90))
+                                .scaleEffect(orbitScale)
+                                .blur(radius: isDragging ? 7 : 5)
+                                .opacity(isDragging ? 0.45 : 0.0)
+                                .animation(.easeInOut(duration: 0.18), value: isDragging)
+                                .animation(.easeInOut(duration: 0.18), value: goalHours)
+                        )
+
+
+                    // Knob — layered, subtle but distinct
+                    ZStack {
+                        // Outer soft glow ring
+                        Circle()
+                            .stroke(Theme.accent.opacity(isDragging ? 0.5 : 0.3), lineWidth: isDragging ? 3 : 2)
+                        // Core
+                        Circle()
+                            .fill(Color.blue.opacity(1))
+                        // Inner highlight dot
+                        Circle()
+                            .fill(Color.white.opacity(0.22))
+                            .frame(width: 8, height: 8)
+                    }
+                    .frame(width: 15, height: 15)
+                    .shadow(color: Theme.accent.opacity(isDragging ? 0.45 : 0.0), radius: isDragging ? 5 : 0)
+                    .scaleEffect(isDragging ? 1.06 : 1.0)
+                    .offset(knobOffset(size: size))
+                    .animation(.interactiveSpring(response: 0.26, dampingFraction: 0.78), value: isDragging)
                 }
                 .frame(width: size, height: size)
                 .contentShape(Circle())
@@ -1404,13 +1540,24 @@ struct GoalDial: View {
                                              dy: value.location.y - center.y)
                             let angle = atan2(v.dy, v.dx) // -π .. +π
 
+                            if !isDragging {
+                                isDragging = true
+                                lastAngle = angle // anchor to avoid jump
+                                accum = 0
+                                Haptics.medium()
+                                return
+                            }
+
                             if let last = lastAngle {
                                 var delta = angle - last
+                                // normalize delta to [-π, π]
                                 if delta > .pi { delta -= 2 * .pi }
                                 if delta < -.pi { delta += 2 * .pi }
 
                                 accum += delta
-                                let stepRad = Double.pi / 12 // ~15° per hour
+                                // radians per one stepHour across the full circle
+                                let stepRad = (2 * Double.pi) * (Double(stepHours) / Double(maxHours - minHours))
+
                                 while accum > stepRad {
                                     if goalHours < maxHours { goalHours += stepHours; Haptics.light() }
                                     accum -= stepRad
@@ -1423,6 +1570,7 @@ struct GoalDial: View {
                             lastAngle = angle
                         }
                         .onEnded { _ in
+                            isDragging = false
                             lastAngle = nil
                             accum = 0
                         }
@@ -1430,12 +1578,15 @@ struct GoalDial: View {
             }
             .frame(width: 200, height: 200)
 
-            Text("\(goalHours) Std")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(Theme.textPri)
-            Text("Ring ziehen zum Ändern")
-                .font(.system(size: 11))
-                .foregroundStyle(Theme.textSec)
+            VStack(spacing: 6) {
+                Text("\(goalHours) Std")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.textPri)
+                Text("Ring drehen zum Ändern")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSec)
+            }
+            .padding(.top, 10)
         }
     }
 }
