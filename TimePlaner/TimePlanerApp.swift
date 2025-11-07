@@ -15,7 +15,7 @@ struct TimeplanerApp: App {
         WindowGroup {
             ContentView()
                 .environment(appState)              // AppState سراسری
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(appState.colorSchemeSwiftUI)
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {

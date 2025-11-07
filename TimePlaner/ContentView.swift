@@ -4,23 +4,49 @@ import Observation
 import Charts
 import UIKit
 
-// MARK: - Theme
+// MARK: - Theme (dynamic for Light/Dark)
 enum Theme {
     static let accent = Color(hue: 0.62, saturation: 0.6, brightness: 0.95)
-    static let bgStart = Color(red: 8/255, green: 10/255, blue: 16/255)
-    static let bgEnd   = Color(red: 18/255, green: 20/255, blue: 30/255)
-    static let card    = Color.white.opacity(0.06)
-    static let stroke  = Color.white.opacity(0.10)
-    static let textPri = Color.white
-    static let textSec = Color.white.opacity(0.7)
-    static let glow    = Color.purple.opacity(0.32)
+
+    static let bgStart = Color(UIColor { tc in
+        tc.userInterfaceStyle == .dark ? UIColor(red: 8/255, green: 10/255, blue: 16/255, alpha: 1)
+                                        : UIColor(red: 240/255, green: 244/255, blue: 252/255, alpha: 1)
+    })
+    static let bgEnd = Color(UIColor { tc in
+        tc.userInterfaceStyle == .dark ? UIColor(red: 18/255, green: 20/255, blue: 30/255, alpha: 1)
+                                        : UIColor(red: 255/255, green: 255/255, blue: 255/255, alpha: 1)
+    })
+    static let card = Color(UIColor { tc in
+        tc.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.06)
+                                        : UIColor(white: 0, alpha: 0.06)
+    })
+    static let stroke = Color(UIColor { tc in
+        tc.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.10)
+                                        : UIColor(white: 0, alpha: 0.10)
+    })
+    static let textPri = Color(UIColor { tc in
+        tc.userInterfaceStyle == .dark ? .white : .black
+    })
+    static let textSec = Color(UIColor { tc in
+        let base: CGFloat = tc.userInterfaceStyle == .dark ? 1.0 : 0.0
+        return UIColor(white: base, alpha: 0.7)
+    })
+    static let glow = Color(UIColor { tc in
+        tc.userInterfaceStyle == .dark ? UIColor.purple.withAlphaComponent(0.32)
+                                        : UIColor.systemTeal.withAlphaComponent(0.26)
+    })
 }
 
 // MARK: - App State / Store + Persistence (dayKey = "yyyy-MM-dd")
 @Observable
 final class AppState {
-    enum Route { case splash, tabs }
-    var route: Route = .splash
+    // Display names for profiles (can be customized later)
+    var profileNames: [Profile: String] = [
+        .person1: "Maryam",
+        .person2: "Mani"
+    ]
+    enum Route { case profile, splash, tabs }
+    var route: Route = .profile
 
     var selectedYear: Int = Calendar.current.component(.year, from: Date())
     var selectedMonth: Int = Calendar.current.component(.month, from: Date())
@@ -32,22 +58,83 @@ final class AppState {
     var defaultGoalHoursPerMonth: Int = 160
     var monthlyGoals: [String: Int] = [:]
 
+    // ---- Auto Goal Settings ----
+    var autoGoalEnabled: Bool = false                 // حالت خودکار
+    var weeklyHours: Int = 30                         // ساعت کاری در هفته
+    // انتخاب روزهای کاری بر اساس Calendar.weekday (Sun=1, Mon=2, ... Sat=7)
+    let workingWeekdays: Set<Int> = [2,3,4,5,6]       // قانوناً: Mo–Fr ثابت
+
+    enum ColorMode: String, Codable, CaseIterable { case system, light, dark }
+    var colorMode: ColorMode = .dark
+    var colorSchemeSwiftUI: ColorScheme? {
+        switch colorMode { case .system: return nil; case .light: return .light; case .dark: return .dark }
+    }
+
+    // Helper: آیا این تاریخ روز کاری انتخاب شده است؟
+    func isWorkingDay(_ date: Date) -> Bool {
+        workingWeekdays.contains(Calendar.isoMonday.component(.weekday, from: date))
+    }
+    // Helper: رُند به نزدیک‌ترین ۱۵ دقیقه
+    private func roundToQuarter(_ minutes: Double) -> Int {
+        let q = 15.0
+        return Int((minutes / q).rounded() * q)
+    }
+    // Target دقیقه برای هر روز کاری
+    func dailyTargetMinutes() -> Int {
+        let days = max(1, workingWeekdays.count)
+        let perDay = (Double(weeklyHours) * 60.0) / Double(days)
+        return roundToQuarter(perDay)
+    }
+    // هدف خودکار ماه (دقیقه)
+    func monthlyAutoGoalMinutes(year: Int, month: Int) -> Int {
+        let cal = Calendar.isoMonday
+        let comps = DateComponents(year: year, month: month, day: 1)
+        guard let first = cal.date(from: comps), let range = cal.range(of: .day, in: .month, for: first) else { return 0 }
+        let perDay = dailyTargetMinutes()
+        var sum = 0
+        for d in range {
+            let c = DateComponents(year: year, month: month, day: d)
+            guard let date = cal.date(from: c) else { continue }
+            guard isWorkingDay(date) else { continue }
+            if berlinHolidayName(on: date) != nil { continue }
+            sum += perDay
+        }
+        return sum
+    }
+
     // MARK: Persistence (JSON)
     private let fileName = "entries.json"
 
     func save() {
+        guard route != .profile else { return }
         do {
-            // ذخیره‌ی داده‌های روزها
             let codable = entriesByDay.mapValues { $0.map { WorkEntryCodable(from: $0) } }
             let data = try JSONEncoder.iso8601.encode(codable)
-            try data.write(to: dataURL(), options: .atomic)
 
-            // ذخیره‌ی تنظیمات ساده
-            let settingsURL = dataURL().deletingLastPathComponent().appendingPathComponent("settings.json")
-            let settingsPayload = AppSettings(defaultGoalHoursPerMonth: defaultGoalHoursPerMonth,
-                                              monthlyGoals: monthlyGoals)
+            // Entries
+            switch activeProfile {
+            case .some(.person2):
+                try data.write(to: fileURL(base: "entries", profile: .person2), options: .atomic)
+            default: // nil or person1 → legacy path
+                try data.write(to: dataURL(), options: .atomic)
+            }
+
+            // Settings
+            let settingsPayload = AppSettings(
+                defaultGoalHoursPerMonth: defaultGoalHoursPerMonth,
+                monthlyGoals: monthlyGoals,
+                autoGoalEnabled: autoGoalEnabled,
+                weeklyHours: weeklyHours,
+                colorMode: colorMode.rawValue
+            )
             let settingsData = try JSONEncoder().encode(settingsPayload)
-            try settingsData.write(to: settingsURL, options: .atomic)
+            switch activeProfile {
+            case .some(.person2):
+                try settingsData.write(to: fileURL(base: "settings", profile: .person2), options: .atomic)
+            default: // nil or person1 → legacy path
+                let settingsURL = dataURL().deletingLastPathComponent().appendingPathComponent("settings.json")
+                try settingsData.write(to: settingsURL, options: .atomic)
+            }
         } catch {
             print("Save error:", error)
         }
@@ -55,24 +142,65 @@ final class AppState {
 
     func load() {
         do {
-            // لود داده‌ها
-            let url = dataURL()
-            if FileManager.default.fileExists(atPath: url.path) {
-                let data = try Data(contentsOf: url)
-                let decoded = try JSONDecoder.iso8601.decode([String: [WorkEntryCodable]].self, from: data)
-                entriesByDay = decoded.mapValues { $0.map { $0.asModel() } }
+            // Entries
+            switch activeProfile {
+            case .some(.person2):
+                let url = fileURL(base: "entries", profile: .person2)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    let data = try Data(contentsOf: url)
+                    let decoded = try JSONDecoder.iso8601.decode([String: [WorkEntryCodable]].self, from: data)
+                    entriesByDay = decoded.mapValues { $0.map { $0.asModel() } }
+                } else {
+                    entriesByDay = [:]
+                }
+            default: // nil or person1 → legacy path
+                let url = dataURL()
+                if FileManager.default.fileExists(atPath: url.path) {
+                    let data = try Data(contentsOf: url)
+                    let decoded = try JSONDecoder.iso8601.decode([String: [WorkEntryCodable]].self, from: data)
+                    entriesByDay = decoded.mapValues { $0.map { $0.asModel() } }
+                } else {
+                    entriesByDay = [:]
+                }
             }
 
-            // لود تنظیمات
-            let settingsURL = dataURL().deletingLastPathComponent().appendingPathComponent("settings.json")
-            if FileManager.default.fileExists(atPath: settingsURL.path) {
-                let settingsData = try Data(contentsOf: settingsURL)
-                if let decoded = try? JSONDecoder().decode(AppSettings.self, from: settingsData) {
-                    defaultGoalHoursPerMonth = decoded.defaultGoalHoursPerMonth
-                    monthlyGoals = decoded.monthlyGoals
-                } else if let dict = try JSONSerialization.jsonObject(with: settingsData) as? [String: Any] {
-                    // مهاجرت از نسخه‌ی قدیمی‌تر (در صورت وجود)
-                    if let def = dict["goalHoursPerMonth"] as? Int { defaultGoalHoursPerMonth = def }
+            // Settings
+            switch activeProfile {
+            case .some(.person2):
+                let settingsURL = fileURL(base: "settings", profile: .person2)
+                if FileManager.default.fileExists(atPath: settingsURL.path) {
+                    let settingsData = try Data(contentsOf: settingsURL)
+                    if let decoded = try? JSONDecoder().decode(AppSettings.self, from: settingsData) {
+                        defaultGoalHoursPerMonth = decoded.defaultGoalHoursPerMonth
+                        monthlyGoals = decoded.monthlyGoals
+                        autoGoalEnabled = decoded.autoGoalEnabled
+                        weeklyHours = decoded.weeklyHours
+                        if let mode = decoded.colorMode, let cm = ColorMode(rawValue: mode) { colorMode = cm }
+                    }
+                } else {
+                    // No settings for person2 yet → start fresh defaults
+                    defaultGoalHoursPerMonth = 160
+                    monthlyGoals = [:]
+                    autoGoalEnabled = false
+                    weeklyHours = 30
+                    // keep current colorMode
+                }
+            default: // nil or person1 → legacy path
+                let settingsURL = dataURL().deletingLastPathComponent().appendingPathComponent("settings.json")
+                if FileManager.default.fileExists(atPath: settingsURL.path) {
+                    let settingsData = try Data(contentsOf: settingsURL)
+                    if let decoded = try? JSONDecoder().decode(AppSettings.self, from: settingsData) {
+                        defaultGoalHoursPerMonth = decoded.defaultGoalHoursPerMonth
+                        monthlyGoals = decoded.monthlyGoals
+                        autoGoalEnabled = decoded.autoGoalEnabled
+                        weeklyHours = decoded.weeklyHours
+                        if let mode = decoded.colorMode, let cm = ColorMode(rawValue: mode) { colorMode = cm }
+                    } else if let dict = try JSONSerialization.jsonObject(with: settingsData) as? [String: Any] {
+                        if let def = dict["goalHoursPerMonth"] as? Int { defaultGoalHoursPerMonth = def }
+                        if let w = dict["weeklyHours"] as? Int { weeklyHours = w }
+                        if let auto = dict["autoGoalEnabled"] as? Bool { autoGoalEnabled = auto }
+                        if let mode = dict["colorMode"] as? String, let cm = ColorMode(rawValue: mode) { colorMode = cm }
+                    }
                 }
             }
         } catch {
@@ -88,6 +216,169 @@ final class AppState {
     struct AppSettings: Codable {
         let defaultGoalHoursPerMonth: Int
         let monthlyGoals: [String: Int]
+        let autoGoalEnabled: Bool
+        let weeklyHours: Int
+        let colorMode: String?
+    }
+
+    // --- Multi-Profile Support ---
+    enum Profile: String, CaseIterable, Identifiable, Equatable {
+        case person1, person2
+        var id: String { rawValue }
+    }
+    var activeProfile: Profile? = nil
+
+    // Helper for profile-based file URLs
+    private func fileURL(base: String, profile: Profile) -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("\(base)_\(profile.rawValue).json")
+    }
+
+    // Legacy single-user file locations (for migration)
+    private var legacyEntriesURL: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("entries.json") }
+    private var legacySettingsURL: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("settings.json") }
+
+    // Switch active profile and load its data
+    func switchProfile(_ p: Profile) {
+        // clear in-memory before loading target profile
+        entriesByDay = [:]
+        monthlyGoals = [:]
+        activeProfile = p
+        load()
+    }
+
+    // Migration: Copy legacy files into new profile if not already present
+    func migrateFromLegacyIfNeeded(to p: Profile) {
+        let fm = FileManager.default
+        let newEntries = fileURL(base: "entries", profile: p)
+        let newSettings = fileURL(base: "settings", profile: p)
+        do {
+            if !fm.fileExists(atPath: newEntries.path), fm.fileExists(atPath: legacyEntriesURL.path) {
+                try fm.copyItem(at: legacyEntriesURL, to: newEntries)
+            }
+            if !fm.fileExists(atPath: newSettings.path), fm.fileExists(atPath: legacySettingsURL.path) {
+                try fm.copyItem(at: legacySettingsURL, to: newSettings)
+            }
+        } catch {
+            print("Migration error:", error)
+        }
+    }
+}
+// MARK: - Profile Picker View
+struct ProfilePickerView: View {
+    @Environment(AppState.self) private var appState
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer(minLength: 24)
+
+            VStack(spacing: 8) {
+                Text("Profil wählen")
+                    .font(.system(size: 28, weight: .heavy, design: .rounded))
+                    .foregroundStyle(Theme.textPri)
+                Text("Für wen möchtest du fortfahren?")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.textSec)
+            }
+            .padding(.top, 12)
+
+            HStack(spacing: 14) {
+                profileCard(
+                    title: (appState.profileNames[.person1] ?? "Person 1"),
+                    subtitle:"Maryams Bereich", //"Bestehende Daten",
+                    system: "person.fill",
+                    gradient: [Theme.accent.opacity(0.85), Color.blue.opacity(0.6)],
+                    action: { select(.person1) }
+                )
+                profileCard(
+                    title: (appState.profileNames[.person2] ?? "Person 2"),
+                    subtitle: "Manis Bereich",//"Neu & getrennt",
+                    system: "person.2.fill",
+                    gradient: [Color.green.opacity(0.8), Theme.accent.opacity(0.65)],
+                    action: { select(.person2) }
+                )
+            }
+            .padding(.horizontal, 16)
+
+            // Hint
+            HStack(spacing: 8) {
+                Image(systemName: "lock.rectangle.on.rectangle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textSec)
+                Text("Person 1 nutzt die bestehenden Dateien · Person 2 ist komplett getrennt")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSec)
+            }
+            .padding(.top, 4)
+
+            Spacer()
+        }
+        .padding(.bottom, 28)
+    }
+
+    private func select(_ profile: AppState.Profile) {
+        Haptics.light()
+        appState.switchProfile(profile)
+        withAnimation(.easeIn(duration: 0.3)) { appState.route = .splash }
+    }
+
+    @ViewBuilder
+    private func profileCard(title: String, subtitle: String, system: String, gradient: [Color], action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            ZStack {
+                // Card base
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Theme.card)
+                    .overlay(
+                        // Soft gradient tint overlay
+                        LinearGradient(colors: gradient, startPoint: .topLeading, endPoint: .bottomTrailing)
+                            .opacity(0.30)
+                            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    )
+                    .overlay(
+                        // Stroke
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .stroke(Theme.stroke, lineWidth: 1)
+                    )
+                    .shadow(color: Theme.accent.opacity(0.20), radius: 18, x: 0, y: 10)
+
+                // Moving orb glow
+                ZStack {
+                    Circle()
+                        .fill(Theme.glow)
+                        .frame(width: 120, height: 120)
+                        .offset(x: -30, y: -30)
+                        .blur(radius: 26)
+                        .opacity(0.8)
+                    Circle()
+                        .fill(gradient.last ?? Theme.accent)
+                        .frame(width: 80, height: 80)
+                        .offset(x: 40, y: 32)
+                        .blur(radius: 22)
+                        .opacity(0.6)
+                }
+                .allowsHitTesting(false)
+
+                // Content
+                VStack(alignment: .leading, spacing: 8) {
+                    Image(systemName: system)
+                        .font(.system(size: 26, weight: .bold))
+                        .foregroundStyle(Theme.textPri)
+                        .symbolRenderingMode(.hierarchical)
+                        .padding(.bottom, 2)
+                    Text(title)
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Theme.textPri)
+                    Text(subtitle)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.textSec)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(18)
+            }
+            .frame(height: 120)
+        }
+        .buttonStyle(PressScaleStyle())
     }
 }
 
@@ -229,12 +520,16 @@ struct ContentView: View {
             DynamicBackground()
             Group {
                 switch appState.route {
-                case .splash: SplashView()
-                case .tabs:   RootTabView()
+                case .profile:
+                    ProfilePickerView()
+                case .splash:
+                    SplashView()
+                case .tabs:
+                    RootTabView()
                 }
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(appState.colorSchemeSwiftUI)
     }
 }
 
@@ -269,25 +564,50 @@ struct MovingOrb: View {
     }
 }
 
-// MARK: - Splash
+// MARK: - Splash (rightward black-to-color sweep)
 struct SplashView: View {
     @Environment(AppState.self) private var appState
-    @State private var show = false
+    @State private var appear = false
+    @State private var sweep: CGFloat = -1.1
+
     var body: some View {
         ZStack {
-            Color.clear.ignoresSafeArea()
-            Text("TimePlaner")
-                .font(.system(size: 44, weight: .heavy, design: .rounded))
-                .foregroundStyle(Theme.textPri)
-                .opacity(show ? 1 : 0)
-                .scaleEffect(show ? 1 : 0.86)
-                .shadow(color: Theme.accent.opacity(0.5), radius: 30)
-                .animation(.spring(response: 0.7, dampingFraction: 0.8), value: show)
+            Rectangle()
+                .fill(LinearGradient(colors: [Theme.bgStart, Theme.bgEnd], startPoint: .topLeading, endPoint: .bottomTrailing))
+                .ignoresSafeArea()
+
+            ZStack {
+                // Color sweep: gradient text masked by moving rectangle
+                Text("TimePlaner")
+                    .font(.system(size: 44, weight: .heavy, design: .rounded))
+                    .kerning(0.5)
+                    .foregroundColor(Theme.textPri)
+                    .mask(
+                        GeometryReader { geo in
+                            let w = geo.size.width
+                            let h = geo.size.height
+                            let bandW = max(110, w * 0.36)
+                            Rectangle()
+                                .fill(
+                                    LinearGradient(gradient: Gradient(stops: [
+                                        .init(color: .white.opacity(0), location: 0.0),
+                                        .init(color: .white.opacity(1), location: 0.5),
+                                        .init(color: .white.opacity(0), location: 1.0)
+                                    ]), startPoint: .leading, endPoint: .trailing)
+                                )
+                                .frame(width: bandW, height: h * 1.6)
+                                .rotationEffect(.degrees(45))
+                                .offset(x: sweep * (w + bandW))
+                        }
+                    )
+            }
+            .animation(.easeInOut(duration: 0.6), value: appear)
         }
         .task {
-            show = true
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            withAnimation(.easeIn(duration: 0.35)) { appState.route = .tabs }
+            withAnimation(.easeOut(duration: 0.3)) { appear = true }
+            withAnimation(.linear(duration: 1.0)) { sweep = 1.1 }
+            try? await Task.sleep(nanoseconds: 1200_000_000)
+            withAnimation(.easeIn(duration: 0.3)) { appState.route = .tabs }
         }
     }
 }
@@ -338,8 +658,15 @@ struct MonateView: View {
     private func monthNetAndDiff(year: Int, month: Int) -> (net: Int, diff: Int) {
         let net = computeMonthTotals(year: year, month: month, data: appState.entriesByDay).net
         let mKey = monthKey(year: year, month: month)
-        let goalHours = appState.monthlyGoals[mKey] ?? appState.defaultGoalHoursPerMonth
-        let diff = net - goalHours * 60
+        let goalMinutes: Int = {
+            if appState.autoGoalEnabled {
+                return appState.monthlyAutoGoalMinutes(year: year, month: month)
+            } else {
+                let hours = appState.monthlyGoals[mKey] ?? appState.defaultGoalHoursPerMonth
+                return hours * 60
+            }
+        }()
+        let diff = net - goalMinutes
         return (net, diff)
     }
 
@@ -546,7 +873,7 @@ struct ProgressRing: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Color.white.opacity(0.1), lineWidth: 14)
+                .stroke(Theme.stroke, lineWidth: 14)
             Circle()
                 .trim(from: 0, to: CGFloat(progress))
                 .stroke(
@@ -566,10 +893,10 @@ struct ProgressRing: View {
             VStack(spacing: 4) {
                 Text(String(format: "%.0f%%", progress * 100))
                     .font(.system(size: 28, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Theme.textPri)
                 Text("\(formatHHmm(totalMinutes)) / \(formatHHmm(goalMinutes))")
                     .font(.system(size: 13, weight: .medium, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.7))
+                    .foregroundStyle(Theme.textSec)
             }
         }
         .frame(width: 180, height: 180)
@@ -615,8 +942,8 @@ struct MonthPickerView: View {
                     totalG += g
                     totalB += breakMinutes(forGross: g)
                 }
-                let hol = isBerlinHoliday(d)
-                credit += hol.creditMin
+                let hol = berlinHolidayName(on: d)
+                if hol != nil { credit += 5 * 60 }
             }
             d = cal.date(byAdding: .day, value: 1, to: d)!
         }
@@ -635,6 +962,31 @@ struct MonthPickerView: View {
             d = cal.date(byAdding: .day, value: 1, to: d)!
         }
         return false
+    }
+
+    // هدف این هفته/بازه بر اساس تنظیمات Auto یا Manual
+    private func targetForWeek(_ w: WeekInfo) -> Int {
+        let cal = Calendar.isoMonday
+        // اگر Auto، جمع dailyTarget برای روزهای کاری این بازه (داخل همین ماه)
+        if appState.autoGoalEnabled {
+            let perDay = appState.dailyTargetMinutes()
+            var sum = 0
+            var d = w.monday
+            let baseMonth = cal.component(.month, from: w.monday)
+            while d <= w.saturday {
+                if cal.component(.month, from: d) == baseMonth, appState.isWorkingDay(d) {
+                    if berlinHolidayName(on: d) == nil {
+                        // فقط روز کاریِ غیرتعطیل وارد هدف شود
+                        sum += perDay
+                    }
+                }
+                d = cal.date(byAdding: .day, value: 1, to: d)!
+            }
+            return sum
+        } else {
+            // Manual: آستانه‌ی ثابت 30h مثل قبل
+            return 30 * 60
+        }
     }
 
     var body: some View {
@@ -662,7 +1014,7 @@ struct MonthPickerView: View {
                             Spacer()
 
                             // Badge 30h: سبز/قرمز/مخفی
-                            let threshold = 30 * 60
+                            let threshold = targetForWeek(w)
                             let diff = net - threshold
                             let hasData = hasEntriesInWeek(w)
                             if hasData && diff != 0 {
@@ -684,9 +1036,8 @@ struct MonthPickerView: View {
 
             // جمع کل اضافه/کم‌کاری همه‌ی هفته‌ها — inline capsule next to label
             Section {
-                let threshold = 30 * 60
                 let totalDelta = weeks.reduce(0) { acc, w in
-                    let diff = netForWeek(w) - threshold
+                    let diff = netForWeek(w) - targetForWeek(w)
                     let hasData = hasEntriesInWeek(w)
                     return (hasData && diff != 0) ? acc + diff : acc
                 }
@@ -753,7 +1104,7 @@ struct MonthPickerView: View {
         .safeAreaInset(edge: .top) {
             let tot = monthlyTotals
             let mKey = monthKey(year: selectedYear, month: selectedMonth)
-            let goalMin = (appState.monthlyGoals[mKey] ?? appState.defaultGoalHoursPerMonth) * 60
+            let goalMin = appState.autoGoalEnabled ? appState.monthlyAutoGoalMinutes(year: selectedYear, month: selectedMonth) : (appState.monthlyGoals[mKey] ?? appState.defaultGoalHoursPerMonth) * 60
             HStack {
                 Spacer()
                 IslandHeader(title: monthNameDE,
@@ -795,8 +1146,8 @@ struct WeekView: View {
             g += dayG
             b += breakMinutes(forGross: dayG)
 
-            let hol = isBerlinHoliday(d)
-            credit += hol.creditMin
+            let hol = berlinHolidayName(on: d)
+            if hol != nil { credit += 5 * 60 }
         }
         return (g + credit, b, max(0, g - b) + credit)
     }
@@ -968,7 +1319,10 @@ struct DayDetailView: View {
 
     private var dayGross: Int { entries.reduce(0) { $0 + minutesBetween($1.start, $1.end) } }
     private var dayBreak: Int { breakMinutes(forGross: dayGross) }
-    private var dayHolidayCredit: Int { isBerlinHoliday(date).creditMin }
+    private var dayHolidayCredit: Int {
+        let hol = berlinHolidayName(on: date)
+        return hol != nil ? 5 * 60 : 0
+    }
     private var dayNet: Int { max(0, dayGross - dayBreak) + dayHolidayCredit }
 
     var body: some View {
@@ -985,7 +1339,7 @@ struct DayDetailView: View {
 
             Section {
                 if entries.isEmpty {
-                    if let name = isBerlinHoliday(date).name {
+                    if let name = berlinHolidayName(on: date) {
                         Text("Feiertag: \(name) (5h Kredit)").foregroundStyle(Theme.textSec)
                     } else {
                         Text("Kein Eintrag").foregroundStyle(Theme.textSec)
@@ -1198,12 +1552,13 @@ struct StatistikView: View {
             let b = breakMinutes(forGross: g)
             totalG += g; totalB += b
 
-            let hol = isBerlinHoliday(date)
-            totalCredit += hol.creditMin
+            let hol = berlinHolidayName(on: date)
+            let credit = hol != nil ? 5 * 60 : 0
+            totalCredit += credit
 
             let kw = cal.component(.weekOfYear, from: date)
             var w = perWeek[kw] ?? (0,0,0)
-            w.g += g; w.b += b; w.credit += hol.creditMin
+            w.g += g; w.b += b; w.credit += credit
             perWeek[kw] = w
         }
 
@@ -1224,8 +1579,13 @@ struct StatistikView: View {
         let result = monthTotals(year: y, month: m, data: appState.entriesByDay)
 
         let mKey = monthKey(year: y, month: m)
-        let goalHours = monthGoalHours
-        let goalMinutes = goalHours * 60
+        let goalMinutes: Int = {
+            if appState.autoGoalEnabled {
+                return appState.monthlyAutoGoalMinutes(year: y, month: m)
+            } else {
+                return (appState.monthlyGoals[mKey] ?? monthGoalHours) * 60
+            }
+        }()
         let progress = goalMinutes > 0 ? min(Double(result.net) / Double(goalMinutes), 1.0) : 0
 
         ScrollView {
@@ -1255,20 +1615,29 @@ struct StatistikView: View {
                     .foregroundStyle(Theme.textPri)
                     .padding(.horizontal, 16)
 
-                // Progress Ring with rotary dial for goal adjustment
-                HStack {
-                    Spacer()
-                    GoalDial(totalNetMinutes: result.net, goalHours: Binding(
-                        get: { monthGoalHours },
-                        set: { newVal in
-                            monthGoalHours = newVal
-                            appState.monthlyGoals[mKey] = newVal
-                            appState.save()
-                        }
-                    ))
-                    Spacer()
+                // Progress area: Auto => only ProgressRing, Manual => interactive GoalDial
+                if appState.autoGoalEnabled {
+                    HStack {
+                        Spacer()
+                        ProgressRing(progress: progress, totalMinutes: result.net, goalMinutes: goalMinutes)
+                        Spacer()
+                    }
+                    .padding(.bottom, 8)
+                } else {
+                    HStack {
+                        Spacer()
+                        GoalDial(totalNetMinutes: result.net, goalHours: Binding(
+                            get: { monthGoalHours },
+                            set: { newVal in
+                                monthGoalHours = newVal
+                                appState.monthlyGoals[mKey] = newVal
+                                appState.save()
+                            }
+                        ))
+                        Spacer()
+                    }
+                    .padding(.bottom, 8)
                 }
-                .padding(.bottom, 8)
 
                 // چیپ‌های خلاصه
                 HStack(spacing: 12) {
@@ -1321,7 +1690,11 @@ struct StatistikView: View {
     private func refreshGoalForCurrentMonth() {
         let y = appState.selectedYear, m = appState.selectedMonth
         let mKey = monthKey(year: y, month: m)
-        monthGoalHours = appState.monthlyGoals[mKey] ?? appState.defaultGoalHoursPerMonth
+        if appState.autoGoalEnabled {
+            monthGoalHours = max(1, appState.monthlyAutoGoalMinutes(year: y, month: m) / 60)
+        } else {
+            monthGoalHours = appState.monthlyGoals[mKey] ?? appState.defaultGoalHoursPerMonth
+        }
     }
 
     private func monthTitle(year: Int, month: Int) -> String {
@@ -1386,11 +1759,62 @@ struct EinstellungenView: View {
     @State private var tempDefaultGoal: Double = 0
 
     var body: some View {
+        @Bindable var app = appState
         NavigationStack {
             Form {
                 Section("Darstellung") {
-                    Text("Dunkles Design ist aktiv.")
+                    Picker("Design", selection: $app.colorMode) {
+                        Text("System").tag(AppState.ColorMode.system)
+                        Text("Hell").tag(AppState.ColorMode.light)
+                        Text("Dunkel").tag(AppState.ColorMode.dark)
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                Section("Arbeitszeit") {
+                    Toggle("Automatische Berechnung aktivieren", isOn: $app.autoGoalEnabled)
+                    Stepper(value: $app.weeklyHours, in: 5...70) {
+                        Text("Stunden pro Woche: \(app.weeklyHours)")
+                    }
+                    HStack {
+                        Text("Arbeitstage (fest)")
+                        Spacer()
+                        Text("Mo–Fr").foregroundStyle(Theme.textSec)
+                    }
+                    // Preview of current month's auto goal
+                    let y = app.selectedYear, m = app.selectedMonth
+                    let preview = app.monthlyAutoGoalMinutes(year: y, month: m)
+                    HStack {
+                        Text("Ziel (dieser Monat)")
+                        Spacer()
+                        Text(formatHHmm(preview))
+                            .foregroundStyle(Theme.textSec)
+                    }
+                }
+
+                // --- Profile section for switching profile at any time ---
+                Section("Profil") {
+                    HStack {
+                        Text("Aktives Profil")
+                        Spacer()
+                        Text(
+                            {
+                                if let p = appState.activeProfile {
+                                    return appState.profileNames[p] ?? p.rawValue
+                                } else {
+                                    return "–"
+                                }
+                            }()
+                        )
                         .foregroundStyle(Theme.textSec)
+                    }
+                    Button(role: .destructive) {
+                        Haptics.warning()
+                        appState.save()
+                        withAnimation(.easeInOut(duration: 0.25)) { appState.route = .profile }
+                    } label: {
+                        Label("Profil wechseln…", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
                 }
 
                 Section("Info") {
@@ -1401,7 +1825,33 @@ struct EinstellungenView: View {
                             .foregroundStyle(Theme.textSec)
                     }
                 }
+
+                // Owner / License info
+                Section("Besitzer") {
+                    HStack {
+                        Text("Name")
+                        Spacer()
+                        Text("Mani Hosseini").foregroundStyle(Theme.textSec)
+                    }
+                    //HStack {
+                        //Text("E‑Mail")
+                        //Spacer()
+                        //Text("mani.scs.gh@gmail.com").foregroundStyle(Theme.textSec)
+                    //}
+                }
+
+                Section {
+                    EmptyView()
+                } footer: {
+                    Text("© 2025 Mani. Alle Rechte vorbehalten.")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.textSec)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
             }
+            .listRowSeparatorTint(Theme.stroke)
+            .listSectionSeparatorTint(Theme.stroke)
             .scrollContentBackground(.hidden)
             .background(Color.clear)
             .navigationTitle("Einstellungen")
