@@ -421,7 +421,7 @@ fileprivate extension Calendar {
     }()
 }
 fileprivate func dayKey(_ date: Date) -> String {
-    let c = Calendar.utc.dateComponents([.year,.month,.day], from: date)
+    let c = Calendar.isoMonday.dateComponents([.year, .month, .day], from: date)
     return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
 }
 fileprivate func monthKey(year: Int, month: Int) -> String {
