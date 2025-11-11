@@ -2,6 +2,7 @@ import SwiftUI
 import Observation
 import Charts
 import UIKit
+import PhotosUI
 
 // MARK: - Theme
 
@@ -319,7 +320,14 @@ final class AppState {
         docs.appendingPathComponent("\(base)_\(profile.rawValue).json")
     }
 
+    func monthImageURL(forYear year: Int, month: Int) -> URL {
+        let key = monthKey(year: year, month: month)
+        let profileId = activeProfile?.rawValue ?? Profile.person1.rawValue
+        return docs.appendingPathComponent("monthimg_\(profileId)_\(key).jpg")
+    }
+
     // Persistence
+    private let lastProfileKey = "lastActiveProfile"
 
     func save() {
         guard let profile = activeProfile, route != .profile else { return }
@@ -355,8 +363,20 @@ final class AppState {
     }
 
     func load() {
-        // Used on launch by old App init: treat as person1/legacy view only
-        loadProfile(activeProfile ?? .person1)
+        // Auto-select last active profile if available
+        if let raw = UserDefaults.standard.string(forKey: lastProfileKey),
+           let p = Profile(rawValue: raw) {
+            activeProfile = p
+            route = .splash
+            loadProfile(p)
+        } else {
+            // No stored profile → show picker
+            route = .profile
+            activeProfile = nil
+            entriesByDay = [:]
+            vacationKeys = []
+            monthlyGoals = [:]
+        }
     }
 
     func switchProfile(_ p: Profile) {
@@ -365,7 +385,17 @@ final class AppState {
         entriesByDay = [:]
         vacationKeys = []
         monthlyGoals = [:]
+        UserDefaults.standard.set(p.rawValue, forKey: lastProfileKey)
         loadProfile(p)
+    }
+
+    func logoutProfile() {
+        UserDefaults.standard.removeObject(forKey: lastProfileKey)
+        activeProfile = nil
+        entriesByDay = [:]
+        vacationKeys = []
+        monthlyGoals = [:]
+        route = .profile
     }
 
     private func loadProfile(_ profile: Profile) {
@@ -969,6 +999,12 @@ struct MonthPickerView: View {
 
     @State private var weeks: [WeekInfo] = []
     @State private var showResetAlert = false
+    @State private var monthImage: UIImage? = nil
+    @State private var photoItem: PhotosPickerItem? = nil
+    @State private var showImagePreview: Bool = false
+    @State private var imageScale: CGFloat = 1.0
+    @State private var imageOffset: CGSize = .zero
+    @State private var lastImageOffset: CGSize = .zero
 
     private var monthlyTotals: (gross: Int, brk: Int, net: Int) {
         computeMonthTotals(
@@ -1036,6 +1072,7 @@ struct MonthPickerView: View {
 
     private func targetForWeek(_ w: WeekInfo) -> Int {
         let cal = Calendar.isoMonday
+        // Auto mode: distribute daily target on working days in this week (within same month)
         if appState.autoGoalEnabled {
             let perDay = appState.dailyTargetMinutes()
             var sum = 0
@@ -1051,7 +1088,34 @@ struct MonthPickerView: View {
             }
             return sum
         } else {
-            return 30 * 60
+            // Manual mode: use configured weeklyHours as reference per week
+            return appState.weeklyHours * 60
+        }
+    }
+
+    private func loadMonthImage() {
+        let url = appState.monthImageURL(forYear: selectedYear, month: selectedMonth)
+        if let data = try? Data(contentsOf: url),
+           let img = UIImage(data: data) {
+            monthImage = img
+        } else {
+            monthImage = nil
+        }
+    }
+
+    private func handlePhotoItemChange(_ item: PhotosPickerItem?) {
+        guard let item = item else { return }
+        Task {
+            if let data = try? await item.loadTransferable(type: Data.self),
+               let _ = UIImage(data: data) {
+                let url = appState.monthImageURL(forYear: selectedYear, month: selectedMonth)
+                do {
+                    try data.write(to: url, options: .atomic)
+                    loadMonthImage()
+                } catch {
+                    print("Month image save error:", error)
+                }
+            }
         }
     }
 
@@ -1175,6 +1239,29 @@ struct MonthPickerView: View {
         .navigationTitle(monthNameDE)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                if let monthImage {
+                    Button {
+                        showImagePreview = true
+                    } label: {
+                        Image(uiImage: monthImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 26, height: 26)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Theme.stroke, lineWidth: 1)
+                            )
+                    }
+                } else {
+                    PhotosPicker(selection: $photoItem, matching: .images) {
+                        Image(systemName: "photo.badge.plus")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                    }
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button(role: .destructive) {
                     showResetAlert = true
@@ -1193,6 +1280,105 @@ struct MonthPickerView: View {
         }
         .task {
             weeks = weeksInMonth(year: selectedYear, month: selectedMonth)
+            loadMonthImage()
+        }
+        .onChange(of: photoItem) { _, newValue in
+            handlePhotoItemChange(newValue)
+        }
+        .sheet(isPresented: $showImagePreview) {
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                VStack {
+                    Spacer()
+                    if let monthImage {
+                        let magnification = MagnificationGesture()
+                            .onChanged { value in
+                                imageScale = min(max(1.0, value), 4.0)
+                            }
+
+                        let drag = DragGesture()
+                            .onChanged { value in
+                                let newWidth = lastImageOffset.width + value.translation.width
+                                let newHeight = lastImageOffset.height + value.translation.height
+
+                                // محدود کردن جابجایی براساس میزان زوم
+                                let maxOffset: CGFloat = 200 * (imageScale - 1) // می‌تونی این 200 رو تنظیم کنی
+                                imageOffset = CGSize(
+                                    width: min(max(newWidth, -maxOffset), maxOffset),
+                                    height: min(max(newHeight, -maxOffset), maxOffset)
+                                )
+                            }
+                            .onEnded { _ in
+                                withAnimation(.spring()) {
+                                    if imageScale <= 1.0 {
+                                        imageScale = 1.0
+                                        imageOffset = .zero
+                                        lastImageOffset = .zero
+                                    } else {
+                                        lastImageOffset = imageOffset
+                                    }
+                                }
+                            }
+                        Image(uiImage: monthImage)
+                            .resizable()
+                            .scaledToFit()
+                            .scaleEffect(imageScale)
+                            .offset(imageOffset)
+                            .gesture(magnification.simultaneously(with: drag))
+                            .onTapGesture(count: 2) {
+                                withAnimation(.spring()) {
+                                    if imageScale > 1.0 {
+                                        imageScale = 1.0
+                                        imageOffset = .zero
+                                    } else {
+                                        imageScale = 2.0
+                                    }
+                                }
+                            }
+                            .shadow(radius: 10)
+                    }
+                    else {
+                        Image(systemName: "photo")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 180, height: 180)
+                            .foregroundColor(.gray.opacity(0.6))
+                    }
+                    Spacer()
+
+                    HStack(spacing: 16) {
+                        // 🗑 Delete
+                        Button {
+                            let url = appState.monthImageURL(forYear: selectedYear, month: selectedMonth)
+                            try? FileManager.default.removeItem(at: url)
+                            monthImage = nil
+                            showImagePreview = false
+                            Haptics.warning()
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                                .font(.system(size: 13, weight: .semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Color.red.opacity(0.78))
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
+                        }
+
+                        // 🔁 Replace
+                        PhotosPicker(selection: $photoItem, matching: .images) {
+                            Label("Replace", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 13, weight: .semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Color.white.opacity(0.22))
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
+                        }
+                    }
+                    .padding(.bottom, 32)
+                }
+            }
         }
         .safeAreaInset(edge: .top) {
             let tot = monthlyTotals
@@ -2155,7 +2341,6 @@ struct ProgressRing: View {
     }
 }
 
-// Simple version of your dial kept as-is from prior iterations
 struct GoalDial: View {
     let totalNetMinutes: Int
     @Binding var goalHours: Int
@@ -2163,43 +2348,221 @@ struct GoalDial: View {
     var maxHours: Int = 190
     var stepHours: Int = 1
 
-    @State private var isDragging = false
+    @State private var lastAngle: Double? = nil   // radians
+    @State private var accum: Double = 0          // accumulated radians since last step
+    @State private var isDragging: Bool = false
+    private let orbitScale: CGFloat = 1.10 // ring the knob orbits on (slightly outside the progress ring)
 
-    private var goalMinutes: Int { goalHours * 60 }
+    // Visual knob position around the ring
+    private var fraction: Double {
+        let clamped = max(minHours, min(maxHours, goalHours))
+        return Double(clamped - minHours) / Double(maxHours - minHours)
+    }
+
+    private func knobOffset(size: CGFloat) -> CGSize {
+        let r = (size / 2) * orbitScale // align knob to the outer orbit ring
+        let angle = -Double.pi / 2 + 2 * Double.pi * fraction
+        return CGSize(
+            width: CGFloat(cos(angle)) * r,
+            height: CGFloat(sin(angle)) * r
+        )
+    }
+
+    // Map polar angle to hours, so knob follows finger directly
+    private func hours(from angle: Double) -> Int {
+        // Map angle (-π..+π) so that -π/2 (top) == 0 fraction; go clockwise
+        var a = angle + Double.pi / 2
+        while a < 0 { a += 2 * Double.pi }
+        while a >= 2 * Double.pi { a -= 2 * Double.pi }
+        let span = maxHours - minHours
+        let raw = Double(minHours) + (a / (2 * Double.pi)) * Double(span)
+        // snap to stepHours
+        let stepped = Double(stepHours) * (raw / Double(stepHours)).rounded()
+        let clamped = max(Double(minHours), min(Double(maxHours), stepped))
+        return Int(clamped)
+    }
+
+    private var goalMinutes: Int {
+        max(minHours, min(maxHours, goalHours)) * 60
+    }
+
     private var progress: Double {
         guard goalMinutes > 0 else { return 0 }
-        return min(Double(totalNetMinutes)/Double(goalMinutes), 1.0)
+        return min(Double(totalNetMinutes) / Double(goalMinutes), 1.0)
     }
 
     var body: some View {
-        VStack(spacing: 6) {
-            ProgressRing(
-                progress: progress,
-                totalMinutes: totalNetMinutes,
-                goalMinutes: goalMinutes
-            )
-            Text("\(goalHours) Std Ziel")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(Theme.textPri)
-            Text("Zum Anpassen tippen + ziehen")
-                .font(.system(size: 10))
-                .foregroundStyle(Theme.textSec)
-        }
-        .gesture(
-            DragGesture()
-                .onChanged { value in
-                    isDragging = true
-                    let delta = Int(value.translation.height / -4)
-                    let new = min(maxHours, max(minHours, goalHours + delta))
-                    if new != goalHours {
-                        goalHours = new
-                        Haptics.light()
+        VStack(spacing: 8) {
+            GeometryReader { geo in
+                let size = min(geo.size.width, geo.size.height)
+
+                ZStack {
+                    // Base ring with progress
+                    ProgressRing(
+                        progress: progress,
+                        totalMinutes: totalNetMinutes,
+                        goalMinutes: goalMinutes
+                    )
+
+                    // Static orbit track (slightly thicker while dragging)
+                    Circle()
+                        .stroke(
+                            Color.blue.opacity(isDragging ? 0.35 : 0.25),
+                            lineWidth: isDragging ? 3 : 2
+                        )
+                        .scaleEffect(orbitScale)
+                        .animation(.easeInOut(duration: 0.18), value: isDragging)
+
+                    // Orbit trail (from top to current position), matching the orbit track
+                    Circle()
+                        .trim(from: 0, to: CGFloat(max(0.001, fraction)))
+                        .stroke(
+                            AngularGradient(
+                                gradient: Gradient(colors: [
+                                    Color.blue,
+                                    Color.green
+                                ]),
+                                center: .center,
+                                startAngle: .degrees(0),
+                                endAngle: .degrees(360)
+                            ),
+                            style: StrokeStyle(
+                                lineWidth: isDragging ? 4 : 3,
+                                lineCap: .round
+                            )
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .scaleEffect(orbitScale)
+                        .opacity(isDragging ? 0.6 : 0.45)
+                        .animation(.easeInOut(duration: 0.18), value: isDragging)
+                        .animation(.easeInOut(duration: 0.18), value: goalHours)
+                        .overlay(
+                            // Glow: duplicate the same trimmed arc, thicker + blurred underlay
+                            Circle()
+                                .trim(from: 0, to: CGFloat(max(0.001, fraction)))
+                                .stroke(
+                                    AngularGradient(
+                                        gradient: Gradient(colors: [
+                                            Color.blue.opacity(0.9),
+                                            Color.green.opacity(0.8)
+                                        ]),
+                                        center: .center,
+                                        startAngle: .degrees(0),
+                                        endAngle: .degrees(360)
+                                    ),
+                                    style: StrokeStyle(
+                                        lineWidth: isDragging ? 5 : 3,
+                                        lineCap: .round
+                                    )
+                                )
+                                .rotationEffect(.degrees(-90))
+                                .scaleEffect(orbitScale)
+                                .blur(radius: isDragging ? 7 : 5)
+                                .opacity(isDragging ? 0.45 : 0.0)
+                                .animation(.easeInOut(duration: 0.18), value: isDragging)
+                                .animation(.easeInOut(duration: 0.18), value: goalHours)
+                        )
+
+                    // Knob — layered, subtle but distinct
+                    ZStack {
+                        // Outer soft glow ring
+                        Circle()
+                            .stroke(
+                                Theme.accent.opacity(isDragging ? 0.5 : 0.3),
+                                lineWidth: isDragging ? 3 : 2
+                            )
+                        // Core
+                        Circle()
+                            .fill(Color.blue.opacity(1))
+                        // Inner highlight dot
+                        Circle()
+                            .fill(Color.white.opacity(0.22))
+                            .frame(width: 8, height: 8)
                     }
+                    .frame(width: 15, height: 15)
+                    .shadow(
+                        color: Theme.accent.opacity(isDragging ? 0.45 : 0.0),
+                        radius: isDragging ? 5 : 0
+                    )
+                    .scaleEffect(isDragging ? 1.06 : 1.0)
+                    .offset(knobOffset(size: size))
+                    .animation(
+                        .interactiveSpring(
+                            response: 0.26,
+                            dampingFraction: 0.78
+                        ),
+                        value: isDragging
+                    )
                 }
-                .onEnded { _ in
-                    isDragging = false
-                }
-        )
+                .frame(width: size, height: size)
+                .contentShape(Circle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            let center = CGPoint(
+                                x: geo.size.width / 2,
+                                y: geo.size.height / 2
+                            )
+                            let v = CGVector(
+                                dx: value.location.x - center.x,
+                                dy: value.location.y - center.y
+                            )
+                            let angle = atan2(v.dy, v.dx) // -π .. +π
+
+                            if !isDragging {
+                                isDragging = true
+                                lastAngle = angle // anchor to avoid jump
+                                accum = 0
+                                Haptics.medium()
+                                return
+                            }
+
+                            if let last = lastAngle {
+                                var delta = angle - last
+                                // normalize delta to [-π, π]
+                                if delta > .pi { delta -= 2 * .pi }
+                                if delta < -.pi { delta += 2 * .pi }
+
+                                accum += delta
+                                // radians per one stepHour across the full circle
+                                let stepRad = (2 * Double.pi) * (Double(stepHours) / Double(maxHours - minHours))
+
+                                while accum > stepRad {
+                                    if goalHours < maxHours {
+                                        goalHours += stepHours
+                                        Haptics.light()
+                                    }
+                                    accum -= stepRad
+                                }
+                                while accum < -stepRad {
+                                    if goalHours > minHours {
+                                        goalHours -= stepHours
+                                        Haptics.light()
+                                    }
+                                    accum += stepRad
+                                }
+                            }
+                            lastAngle = angle
+                        }
+                        .onEnded { _ in
+                            isDragging = false
+                            lastAngle = nil
+                            accum = 0
+                        }
+                )
+            }
+            .frame(width: 200, height: 200)
+
+            VStack(spacing: 6) {
+                Text("\(goalHours) Std")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.textPri)
+                Text("Ring drehen zum Ändern")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSec)
+            }
+            .padding(.top, 10)
+        }
     }
 }
 
@@ -2264,7 +2627,7 @@ struct EinstellungenView: View {
                         appState.save()
                         Haptics.warning()
                         withAnimation(.easeInOut(duration: 0.25)) {
-                            appState.route = .profile
+                            appState.logoutProfile()
                         }
                     } label: {
                         Label("Profil wechseln…", systemImage: "rectangle.portrait.and.arrow.right")
