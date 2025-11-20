@@ -71,6 +71,20 @@ private struct WorkEntryCodable: Codable {
     }
 }
 
+struct TimeTemplate: Identifiable, Codable, Hashable {
+    let id: UUID
+    var name: String
+    var startMinutes: Int  // Minuten ab Mitternacht
+    var endMinutes: Int    // Minuten ab Mitternacht
+
+    init(id: UUID = UUID(), name: String, startMinutes: Int, endMinutes: Int) {
+        self.id = id
+        self.name = name
+        self.startMinutes = startMinutes
+        self.endMinutes = endMinutes
+    }
+}
+
 // MARK: - Utils
 
 fileprivate extension Calendar {
@@ -229,6 +243,23 @@ final class AppState {
         let autoGoalEnabled: Bool
         let weeklyHours: Int
         let colorMode: String?
+        let timeTemplates: [TimeTemplate]?
+
+        init(
+            defaultGoalHoursPerMonth: Int,
+            monthlyGoals: [String: Int],
+            autoGoalEnabled: Bool,
+            weeklyHours: Int,
+            colorMode: String?,
+            timeTemplates: [TimeTemplate]?
+        ) {
+            self.defaultGoalHoursPerMonth = defaultGoalHoursPerMonth
+            self.monthlyGoals = monthlyGoals
+            self.autoGoalEnabled = autoGoalEnabled
+            self.weeklyHours = weeklyHours
+            self.colorMode = colorMode
+            self.timeTemplates = timeTemplates
+        }
     }
 
     // Routing
@@ -252,6 +283,9 @@ final class AppState {
     // Goals
     var defaultGoalHoursPerMonth: Int = 160
     var monthlyGoals: [String: Int] = [:]
+    // Time templates (schnelle Zeit-Vorlagen)
+    var timeTemplates: [TimeTemplate] = []
+
 
     // Auto goal
     var autoGoalEnabled: Bool = false
@@ -341,7 +375,8 @@ final class AppState {
                 monthlyGoals: monthlyGoals,
                 autoGoalEnabled: autoGoalEnabled,
                 weeklyHours: weeklyHours,
-                colorMode: colorMode.rawValue
+                colorMode: colorMode.rawValue,
+                timeTemplates: timeTemplates
             )
             let settingsData = try JSONEncoder().encode(settings)
 
@@ -385,6 +420,7 @@ final class AppState {
         entriesByDay = [:]
         vacationKeys = []
         monthlyGoals = [:]
+        timeTemplates = []
         UserDefaults.standard.set(p.rawValue, forKey: lastProfileKey)
         loadProfile(p)
     }
@@ -395,6 +431,7 @@ final class AppState {
         entriesByDay = [:]
         vacationKeys = []
         monthlyGoals = [:]
+        timeTemplates = []
         route = .profile
     }
 
@@ -453,6 +490,7 @@ final class AppState {
                     {
                         colorMode = cm
                     }
+                    timeTemplates = decoded.timeTemplates ?? []
                 }
             } else if profile == .person2 {
                 // fresh defaults for new profile
@@ -460,6 +498,7 @@ final class AppState {
                 monthlyGoals = [:]
                 autoGoalEnabled = false
                 weeklyHours = 30
+                timeTemplates = []
             }
 
         } catch {
@@ -992,6 +1031,12 @@ fileprivate func computeMonthTotals(
 }
 
 struct MonthPickerView: View {
+    // Helper type for stored month images
+    private struct StoredMonthImage: Identifiable, Equatable {
+        let id = UUID()
+        let url: URL
+        let image: UIImage
+    }
     @Environment(AppState.self) private var appState
     let selectedYear: Int
     let selectedMonth: Int
@@ -999,7 +1044,10 @@ struct MonthPickerView: View {
 
     @State private var weeks: [WeekInfo] = []
     @State private var showResetAlert = false
-    @State private var monthImage: UIImage? = nil
+
+    // Multiple images per month
+    @State private var monthImages: [StoredMonthImage] = []
+    @State private var currentImageIndex: Int = 0
     @State private var photoItem: PhotosPickerItem? = nil
     @State private var showImagePreview: Bool = false
     @State private var imageScale: CGFloat = 1.0
@@ -1020,7 +1068,8 @@ struct MonthPickerView: View {
         appState.entriesByDay.keys
             .filter { $0.hasPrefix(monthPrefix) }
             .forEach { appState.entriesByDay.removeValue(forKey: $0) }
-        appState.vacationKeys = appState.vacationKeys.filter { !$0.hasPrefix(monthPrefix) }
+        let toRemove = appState.vacationKeys.filter { $0.hasPrefix(monthPrefix) }
+        appState.vacationKeys.subtract(toRemove)
         appState.save()
         Haptics.warning()
     }
@@ -1072,34 +1121,58 @@ struct MonthPickerView: View {
 
     private func targetForWeek(_ w: WeekInfo) -> Int {
         let cal = Calendar.isoMonday
-        // Auto mode: distribute daily target on working days in this week (within same month)
+        // Auto mode: show full weekly target per KW (e.g., 20h), regardless of holidays/partial weeks.
         if appState.autoGoalEnabled {
-            let perDay = appState.dailyTargetMinutes()
-            var sum = 0
-            var d = w.monday
-            let baseMonth = cal.component(.month, from: w.monday)
-            while d <= w.saturday {
-                if cal.component(.month, from: d) == baseMonth,
-                   appState.isWorkingDay(d),
-                   berlinHolidayName(on: d) == nil {
-                    sum += perDay
-                }
-                d = cal.date(byAdding: .day, value: 1, to: d)!
-            }
-            return sum
+            // Show full weekly target per KW (e.g., 20h), regardless of holidays/partial weeks.
+            // Net side already includes credits for holidays; we do not lower the target.
+            return appState.weeklyHours * 60
         } else {
-            // Manual mode: use configured weeklyHours as reference per week
+            // Manual mode: use the full configured weeklyHours for each displayed KW,
+            // regardless of partial weeks across month boundaries.
             return appState.weeklyHours * 60
         }
     }
 
-    private func loadMonthImage() {
-        let url = appState.monthImageURL(forYear: selectedYear, month: selectedMonth)
-        if let data = try? Data(contentsOf: url),
-           let img = UIImage(data: data) {
-            monthImage = img
-        } else {
-            monthImage = nil
+    /// Directory to store multiple images for this month
+    private func monthImagesDirectoryURL() -> URL {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dirName = String(format: "monthImages_%04d_%02d", selectedYear, selectedMonth)
+        let dir = docs.appendingPathComponent(dirName, isDirectory: true)
+        if !fm.fileExists(atPath: dir.path) {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    private func loadMonthImages() {
+        let dir = monthImagesDirectoryURL()
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            monthImages = []
+            currentImageIndex = 0
+            return
+        }
+
+        let exts = ["jpg", "jpeg", "png", "heic"]
+        let imageFiles = files
+            .filter { exts.contains($0.pathExtension.lowercased()) }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        var loaded: [StoredMonthImage] = []
+        for url in imageFiles {
+            if let data = try? Data(contentsOf: url),
+               let img = UIImage(data: data) {
+                loaded.append(StoredMonthImage(url: url, image: img))
+            }
+        }
+        monthImages = loaded
+        if currentImageIndex >= monthImages.count {
+            currentImageIndex = max(0, monthImages.count - 1)
         }
     }
 
@@ -1108,10 +1181,12 @@ struct MonthPickerView: View {
         Task {
             if let data = try? await item.loadTransferable(type: Data.self),
                let _ = UIImage(data: data) {
-                let url = appState.monthImageURL(forYear: selectedYear, month: selectedMonth)
+                let dir = monthImagesDirectoryURL()
+                let filename = UUID().uuidString + ".jpg"
+                let url = dir.appendingPathComponent(filename)
                 do {
                     try data.write(to: url, options: .atomic)
-                    loadMonthImage()
+                    loadMonthImages()
                 } catch {
                     print("Month image save error:", error)
                 }
@@ -1240,11 +1315,15 @@ struct MonthPickerView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
-                if let monthImage {
+                if let first = monthImages.first {
                     Button {
+                        currentImageIndex = 0
+                        imageScale = 1.0
+                        imageOffset = .zero
+                        lastImageOffset = .zero
                         showImagePreview = true
                     } label: {
-                        Image(uiImage: monthImage)
+                        Image(uiImage: first.image)
                             .resizable()
                             .scaledToFill()
                             .frame(width: 26, height: 26)
@@ -1280,7 +1359,7 @@ struct MonthPickerView: View {
         }
         .task {
             weeks = weeksInMonth(year: selectedYear, month: selectedMonth)
-            loadMonthImage()
+            loadMonthImages()
         }
         .onChange(of: photoItem) { _, newValue in
             handlePhotoItemChange(newValue)
@@ -1291,54 +1370,92 @@ struct MonthPickerView: View {
 
                 VStack {
                     Spacer()
-                    if let monthImage {
-                        let magnification = MagnificationGesture()
-                            .onChanged { value in
-                                imageScale = min(max(1.0, value), 4.0)
-                            }
-
-                        let drag = DragGesture()
-                            .onChanged { value in
-                                let newWidth = lastImageOffset.width + value.translation.width
-                                let newHeight = lastImageOffset.height + value.translation.height
-
-                                // محدود کردن جابجایی براساس میزان زوم
-                                let maxOffset: CGFloat = 200 * (imageScale - 1) // می‌تونی این 200 رو تنظیم کنی
-                                imageOffset = CGSize(
-                                    width: min(max(newWidth, -maxOffset), maxOffset),
-                                    height: min(max(newHeight, -maxOffset), maxOffset)
-                                )
-                            }
-                            .onEnded { _ in
-                                withAnimation(.spring()) {
-                                    if imageScale <= 1.0 {
-                                        imageScale = 1.0
-                                        imageOffset = .zero
-                                        lastImageOffset = .zero
-                                    } else {
-                                        lastImageOffset = imageOffset
+                    if !monthImages.isEmpty {
+                        TabView(selection: $currentImageIndex) {
+                            ForEach(Array(monthImages.enumerated()), id: \.1.id) { idx, item in
+                                let magnification = MagnificationGesture()
+                                    .onChanged { value in
+                                        imageScale = min(max(1.0, value), 4.0)
                                     }
+                                
+                                let drag = DragGesture()
+                                    .onChanged { value in
+                                        // Only pan when zoomed in; otherwise let TabView handle horizontal swipes
+                                        guard imageScale > 1.0 else { return }
+                                        
+                                        let newWidth = lastImageOffset.width + value.translation.width
+                                        let newHeight = lastImageOffset.height + value.translation.height
+                                        
+                                        let maxOffset: CGFloat = 200 * (imageScale - 1)
+                                        imageOffset = CGSize(
+                                            width: min(max(newWidth, -maxOffset), maxOffset),
+                                            height: min(max(newHeight, -maxOffset), maxOffset)
+                                        )
+                                    }
+                                    .onEnded { _ in
+                                        withAnimation(.spring()) {
+                                            if imageScale <= 1.0 {
+                                                imageScale = 1.0
+                                                imageOffset = .zero
+                                                lastImageOffset = .zero
+                                            } else {
+                                                lastImageOffset = imageOffset
+                                            }
+                                        }
+                                    }
+                                
+                                if imageScale > 1.0 {
+                                    Image(uiImage: item.image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .scaleEffect(imageScale)
+                                        .offset(imageOffset)
+                                        .gesture(magnification.simultaneously(with: drag))
+                                        .onTapGesture(count: 2) {
+                                            withAnimation(.spring()) {
+                                                if imageScale > 1.0 {
+                                                    imageScale = 1.0
+                                                    imageOffset = .zero
+                                                } else {
+                                                    imageScale = 2.0
+                                                }
+                                            }
+                                        }
+                                        .shadow(radius: 10)
+                                        .tag(idx)
+                                } else {
+                                    Image(uiImage: item.image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .scaleEffect(imageScale)
+                                        .offset(imageOffset)
+                                        .gesture(magnification)
+                                        .onTapGesture(count: 2) {
+                                            withAnimation(.spring()) {
+                                                if imageScale > 1.0 {
+                                                    imageScale = 1.0
+                                                    imageOffset = .zero
+                                                } else {
+                                                    imageScale = 2.0
+                                                }
+                                            }
+                                        }
+                                        .shadow(radius: 10)
+                                        .tag(idx)
                                 }
                             }
-                        Image(uiImage: monthImage)
-                            .resizable()
-                            .scaledToFit()
-                            .scaleEffect(imageScale)
-                            .offset(imageOffset)
-                            .gesture(magnification.simultaneously(with: drag))
-                            .onTapGesture(count: 2) {
-                                withAnimation(.spring()) {
-                                    if imageScale > 1.0 {
-                                        imageScale = 1.0
-                                        imageOffset = .zero
-                                    } else {
-                                        imageScale = 2.0
-                                    }
-                                }
+                        }
+                        .tabViewStyle(.page)
+                        .indexViewStyle(.page(backgroundDisplayMode: .automatic))
+                        .onChange(of: currentImageIndex) { _, _ in
+                            // Reset zoom when switching images
+                            withAnimation(.spring()) {
+                                imageScale = 1.0
+                                imageOffset = .zero
+                                lastImageOffset = .zero
                             }
-                            .shadow(radius: 10)
-                    }
-                    else {
+                        }
+                    } else {
                         Image(systemName: "photo")
                             .resizable()
                             .scaledToFit()
@@ -1347,27 +1464,44 @@ struct MonthPickerView: View {
                     }
                     Spacer()
 
-                    HStack(spacing: 16) {
-                        // 🗑 Delete
-                        Button {
-                            let url = appState.monthImageURL(forYear: selectedYear, month: selectedMonth)
-                            try? FileManager.default.removeItem(at: url)
-                            monthImage = nil
-                            showImagePreview = false
-                            Haptics.warning()
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                                .font(.system(size: 13, weight: .semibold))
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(Color.red.opacity(0.78))
-                                .foregroundColor(.white)
-                                .clipShape(Capsule())
-                        }
+                    if !monthImages.isEmpty {
+                        HStack(spacing: 16) {
+                            // 🗑 Delete current image
+                            Button {
+                                let idx = currentImageIndex
+                                guard monthImages.indices.contains(idx) else { return }
+                                let url = monthImages[idx].url
+                                try? FileManager.default.removeItem(at: url)
+                                loadMonthImages()
+                                if monthImages.isEmpty {
+                                    showImagePreview = false
+                                }
+                                Haptics.warning()
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.red.opacity(0.78))
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                            }
 
-                        // 🔁 Replace
+                            // ➕ Add another image
+                            PhotosPicker(selection: $photoItem, matching: .images) {
+                                Label("Add", systemImage: "plus.circle")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.white.opacity(0.22))
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                            }
+                        }
+                        .padding(.bottom, 32)
+                    } else {
                         PhotosPicker(selection: $photoItem, matching: .images) {
-                            Label("Replace", systemImage: "arrow.triangle.2.circlepath")
+                            Label("Add first photo", systemImage: "plus.circle")
                                 .font(.system(size: 13, weight: .semibold))
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 8)
@@ -1375,8 +1509,8 @@ struct MonthPickerView: View {
                                 .foregroundColor(.white)
                                 .clipShape(Capsule())
                         }
+                        .padding(.bottom, 32)
                     }
-                    .padding(.bottom, 32)
                 }
             }
         }
@@ -1754,15 +1888,21 @@ struct DayDetailView: View {
                         .onTapGesture {
                             editTarget = e
                         }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button("Bearbeiten") {
-                                editTarget = e
-                            }.tint(.blue)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            // Primary, rightmost action: Delete (red)
                             Button(role: .destructive) {
                                 delete(id: e.id)
                             } label: {
                                 Label("Löschen", systemImage: "trash")
                             }
+                            .tint(.red)
+                            // Secondary action: Edit (blue)
+                            Button {
+                                editTarget = e
+                            } label: {
+                                Text("Bearbeiten")
+                            }
+                            .tint(.blue)
                         }
                     }
                     .onDelete(perform: deleteOffsets)
@@ -1877,7 +2017,8 @@ struct EntryEditorView: View {
 
     let mode: Mode
     var onSave: (WorkEntry) -> Void
-
+    
+    @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
     @State private var startTime: Date = Date()
     @State private var endTime: Date = Date().addingTimeInterval(3600)
@@ -1885,6 +2026,12 @@ struct EntryEditorView: View {
     @State private var errorText: String? = nil
 
     private let cal = Calendar.isoMonday
+    private var day: Date {
+        switch mode {
+        case .new(let d): return d
+        case .edit(let d, _): return d
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -1893,6 +2040,59 @@ struct EntryEditorView: View {
                     DatePicker("Start", selection: $startTime, displayedComponents: .hourAndMinute)
                     DatePicker("Ende", selection: $endTime, displayedComponents: .hourAndMinute)
                 }
+
+                if !appState.timeTemplates.isEmpty {
+                    Section("Vorlagen") {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(appState.timeTemplates) { tpl in
+                                    Button {
+                                        applyTemplate(tpl)
+                                    } label: {
+                                        Text(tpl.name)
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 6)
+                                            .background(
+                                                Capsule()
+                                                    .fill(Theme.card)
+                                            )
+                                            .overlay(
+                                                Capsule()
+                                                    .stroke(Theme.stroke, lineWidth: 1)
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .contextMenu {
+                                        Button(role: .destructive) {
+                                            deleteTemplate(tpl)
+                                        } label: {
+                                            Label("Vorlage löschen", systemImage: "trash")
+                                        }
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+
+                        Button {
+                            addCurrentTimeAsTemplate()
+                        } label: {
+                            Label("Aktuelle Zeit als Vorlage speichern", systemImage: "plus.circle")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                    }
+                } else {
+                    Section("Vorlagen") {
+                        Button {
+                            addCurrentTimeAsTemplate()
+                        } label: {
+                            Label("Aktuelle Zeit als erste Vorlage speichern", systemImage: "plus.circle")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                    }
+                }
+
                 Section("Notiz (optional)") {
                     TextField("…", text: $note)
                 }
@@ -2003,6 +2203,59 @@ struct EntryEditorView: View {
         c.minute = t.minute
         c.second = 0
         return cal.date(from: c) ?? day
+    }
+
+    private func deleteTemplate(_ template: TimeTemplate) {
+        if let idx = appState.timeTemplates.firstIndex(where: { $0.id == template.id }) {
+            appState.timeTemplates.remove(at: idx)
+            appState.save()
+            Haptics.warning()
+        }
+    }
+
+    private func applyTemplate(_ template: TimeTemplate) {
+        let s = dateFromMinutes(template.startMinutes, on: day)
+        let e = dateFromMinutes(template.endMinutes, on: day)
+        startTime = s
+        endTime = e
+    }
+
+    private func addCurrentTimeAsTemplate() {
+        guard endTime > startTime else { return }
+
+        let startMinutes = minutesFromMidnight(startTime)
+        let endMinutes = minutesFromMidnight(endTime)
+
+        // keine Duplikate mit gleicher Zeitspanne
+        if appState.timeTemplates.contains(where: { $0.startMinutes == startMinutes && $0.endMinutes == endMinutes }) {
+            return
+        }
+
+        let name = timeRangeLabel(start: startTime, end: endTime)
+        let tpl = TimeTemplate(name: name, startMinutes: startMinutes, endMinutes: endMinutes)
+        appState.timeTemplates.append(tpl)
+        appState.save()
+        Haptics.success()
+    }
+
+    private func minutesFromMidnight(_ date: Date) -> Int {
+        let comps = cal.dateComponents([.hour, .minute], from: date)
+        let h = comps.hour ?? 0
+        let m = comps.minute ?? 0
+        return h * 60 + m
+    }
+
+    private func dateFromMinutes(_ minutes: Int, on day: Date) -> Date {
+        let hour = minutes / 60
+        let minute = minutes % 60
+        return cal.date(bySettingHour: hour, minute: minute, second: 0, of: day) ?? day
+    }
+
+    private func timeRangeLabel(start: Date, end: Date) -> String {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "de_DE")
+        df.dateFormat = "HH:mm"
+        return df.string(from: start) + "–" + df.string(from: end)
     }
 }
 
@@ -2184,15 +2437,64 @@ struct StatistikView: View {
                             .foregroundStyle(Theme.textSec)
                             .padding(.horizontal, 16)
 
-                        Chart(result.weeks) { w in
-                            BarMark(
-                                x: .value("KW", "KW \(w.kw)"),
-                                y: .value("Arbeitszeit (min)", w.net)
+                        Chart {
+                            // Säulen je Woche
+                            ForEach(result.weeks) { w in
+                                let targetMinutes = appState.weeklyHours * 60
+                                let diff = w.net - targetMinutes
+                                // Nur Wochen mit echten Daten beschriften
+                                let hasData = (w.net > 0 || w.gross > 0 || w.brk > 0)
+
+                                let diffText: String = {
+                                    if diff == 0 { return "±00:00" }
+                                    let sign = diff > 0 ? "+" : "-"
+                                    return sign + formatHHmm(abs(diff))
+                                }()
+
+                                BarMark(
+                                    x: .value("KW", "KW \(w.kw)"),
+                                    y: .value("Arbeitszeit (min)", w.net)
+                                )
+                                .annotation(position: .top) {
+                                    if hasData {
+                                        VStack(spacing: 2) {
+                                            // Gesamt-Arbeitszeit der Woche
+                                            Text(formatHHmm(w.net))
+                                                .font(.system(size: 10, weight: .semibold))
+                                                .monospacedDigit()
+                                                .multilineTextAlignment(.center)
+                                                .foregroundStyle(Theme.textSec)
+
+                                            // Abweichung vom Wochenziel (grün = Überstunden, rot = Unterstunden)
+                                            Text(diffText)
+                                                .font(.system(size: 9, weight: .semibold))
+                                                .monospacedDigit()
+                                                .multilineTextAlignment(.center)
+                                                .foregroundStyle(
+                                                    diff == 0
+                                                    ? Theme.textSec
+                                                    : (diff > 0 ? Color.green : Color.red)
+                                                )
+                                        }
+                                    }
+                                }
+                            }
+                            // Horizontale Ziel-Linie basierend auf Wochenstunden aus den Einstellungen
+                            RuleMark(
+                                y: .value("Ziel", appState.weeklyHours * 60)
                             )
-                            .annotation(position: .top) {
-                                Text(formatHHmm(w.net))
+                            .foregroundStyle(.red)
+                            .lineStyle(StrokeStyle(lineWidth: 2, dash: [4]))
+                            .annotation(position: .topLeading, alignment: .leading) {
+                                Text("Ziel: \(formatHHmm(appState.weeklyHours * 60))")
                                     .font(.system(size: 10, weight: .semibold))
-                                    .foregroundStyle(Theme.textSec)
+                                    .foregroundStyle(.red)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 2)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .fill(Color(.systemBackground).opacity(0.9))
+                                    )
                             }
                         }
                         .chartYAxis {
